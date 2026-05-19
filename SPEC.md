@@ -40,7 +40,7 @@ The output is a list of PHAsset identifiers the user can confidently delete from
 
 - **Asset**: one photo/video. Identity = (PHAsset identifier, optional SHA-256 of original bytes).
 - **Storage**: a configured backend with a type (`photos_macos`, `immich_api`, `ssh_zfs_snapshot`, `s3_rclone`) and an identifier.
-- **Presence**: a row joining (Asset, Storage) — `expected_hash`, `observed_hash`, `last_verified_at`, `status`, opaque metadata blob (e.g., Immich asset id, S3 key, snapshot path).
+- **Presence**: a row joining (Asset, Storage) — `expected_hash`, `observed_hash`, `last_verified_at`, `verification_method` (`identity` or `deep`), `status`, opaque metadata blob (e.g., Immich asset id, S3 key, snapshot path).
 - **Flow**: declarative rule. "Assets from source X, filtered by exclusions Y, must be present in replicas [A settled-after Δ_a, B settled-after Δ_b, ...]."
 
 ## Identity & matching
@@ -57,17 +57,48 @@ SHA-256 is used for **deep-check** (`trove deepcheck`) and for **periodic spot a
 
 Perceptual hash (pHash) is **deferred**. Add it only when we hit a real "same photo, different bytes" cross-tier divergence.
 
+## Resource model and edge cases
+
+A PHAsset is not always one file, and "present in Immich" is not always a yes/no. The cleanup-report algorithm must respect the following.
+
+### Multi-resource assets
+
+A single PHAsset can hold multiple resources. Trove counts the asset as durable only when **all required resources** are present.
+
+- **Live Photos**: still (HEIC/JPEG) + paired motion video (MOV). Immich preserves the pairing when uploaded via its iOS app; both must be durable for the PHAsset to be safe-to-delete. If Immich is missing the motion (e.g., the iOS app was configured to skip Live motion), the asset is reported as not safe — Photos is the source of truth for what resources exist; Immich must mirror them.
+- **RAW + JPEG pairs**: one PHAsset with `PHAssetResourceTypePhoto` (JPEG) and `PHAssetResourceTypeAlternatePhoto` (RAW DNG). Both required.
+- **Edits**: identity is the **original bytes**. Durability of the original is sufficient — the edit is reproducible from non-destructive edit metadata. Presence of the edit is reported as bonus, not required.
+
+### Immich asset states
+
+Treat as present when Immich-side state is `active` or `archived`. Treat as **not** present:
+
+- `trashed` — scheduled for hard deletion. Trove must not mark these safe-to-delete from Photos.
+- (Stack children count as present — they're stored normally, just grouped in the UI.)
+
+### Photos.sqlite while Photos.app is running
+
+Photos.sqlite uses WAL and may be locked when Photos.app is open. Open with `mode=ro` (without `immutable=1`, since the file mutates underneath). On `SQLITE_BUSY`, retry briefly; if still locked, surface a clear error asking the user to close Photos.app. Do **not** copy the file as a workaround — a live-WAL copy risks an inconsistent read.
+
+### Assets in Immich without a PHAsset id
+
+Immich content from before the iOS app (Lightroom export, manual web upload, etc.) has no source PHAsset identifier. For v1 these are "not bridge-matchable": a Photos.app asset will be reported "missing from Immich" even if the same bytes exist there under another upload path. SHA-256 fallback matching is a deferred extension (related to the pHash deferral noted above).
+
 ## The cleanup-report algorithm
 
 ```
 For each asset A in Photos.sqlite:
   If A is in any Immich-excluded album (e.g. WhatsApp, Reinvent, Animated, SBP, DJI Album):
     skip — DELIBERATELY not in Immich; never eligible for cleanup
-  If A.PHAssetID not in Immich asset list:
+  If A.PHAssetID not in Immich asset list, OR the matched Immich asset is in state `trashed`:
     report: "missing from Immich" — not safe
-  Resolve A → Immich asset → storage path P, expected hash H
-  Verify P exists in cache/immich snapshot S where (now - S.timestamp) ≥ settling[snapshot]
-  Verify P (or its derived S3 key) exists in S3 where (now - object.last_modified) ≥ settling[s3]
+  Enumerate Photos resources R for A (still, motion, RAW, JPEG, etc. — Photos is source of truth)
+  For each resource r in R:
+    Find r's counterpart in Immich (matched by resource type / pairing convention)
+    If counterpart missing in Immich:
+      report: "Immich missing resource <type>" — not safe; stop checking other resources
+    Verify counterpart's storage path exists in cache/immich snapshot S where (now - S.timestamp) ≥ settling[snapshot]
+    Verify counterpart (or its derived S3 key) exists in S3 where (now - object.last_modified) ≥ settling[s3]
   If all checks pass:
     A is "safe to delete from Photos.app"
   Else:
@@ -76,16 +107,26 @@ For each asset A in Photos.sqlite:
 
 Default settling tolerances:
 - snapshot replica: ≥ 22h (covers one autosnap + syncoid cycle at ~01:15)
-- S3 replica: depends on `s3_backup` user script schedule — must be read from `/boot/config/plugins/user.scripts/scripts/s3_backup/` before building the S3 adapter
+- S3 replica: ≥ 30h (covers autosnap @ ~01:15 → syncoid → Unraid `cron.daily` @ 04:40 → `s3_backup` user script → rclone sync, with margin)
 
 `trove cleanup-report` returns the safe list. The user does the actual deleting in Photos.app.
+
+## Verification cache
+
+Deep checks are expensive — they download bytes from S3 (the only tier without a cheap server-side hash, since the bucket uses SSE-KMS and ETag is opaque) and SHA-256 them locally. Every successful verification writes `last_verified_at`, `observed_hash`, and `verification_method` (`identity` or `deep`) to the Presence row.
+
+`trove verify` and `trove deepcheck` skip an (Asset, Storage) pair when:
+- Last verification is within the storage's freshness window (default 7d for `identity`, 90d for `deep`), AND
+- Cheap identity signals (size, last-modified) match the cached values — proving the replica byte stream hasn't been rewritten.
+
+`--force` ignores the cache. Each run reports skipped vs. re-verified counts so coverage stays auditable.
 
 ## Storage adapters (v1)
 
 ### `photos_macos`
 
 - Reads the macOS Photos library (`~/Pictures/Photos Library.photoslibrary/database/Photos.sqlite`).
-- Returns: PHAsset identifier, original filename, capture date, file size, album memberships.
+- Returns: PHAsset identifier, original filename, capture date, file size, album memberships, **resource list** (one entry per `PHAssetResource` — type such as photo/video/alternatePhoto/pairedVideo, size, UTI).
 - **Implementation note**: try direct SQLite first — Photos.sqlite is well-documented (cf. `osxphotos`'s schema reverse-engineering). If Apple-version churn becomes a maintenance problem, swap in a small Swift PhotoKit helper behind the same interface.
 
 ### `immich_api`
@@ -97,25 +138,31 @@ Default settling tolerances:
 ### `ssh_zfs_snapshot`
 
 - SSHes to `orion.local.dewijer.nl`, picks the most recent `cache/immich@autosnap_*_daily` snapshot older than the settling tolerance, lists files within `library/` of that snapshot.
-- ZFS snapshots are accessible via the hidden `.zfs/snapshot/<name>/` directory on the dataset's mountpoint, OR via `zfs list -t snapshot` + `zfs send`. Use the `.zfs` directory — it's listable like a regular filesystem.
+- Snapshot naming pattern: `^autosnap_\d{4}-\d{2}-\d{2}_\d{2}:\d{2}:\d{2}_(hourly|daily|weekly|monthly)$`. The adapter filters by `daily` for routine checks.
+- ZFS snapshots are accessible via the hidden `.zfs/snapshot/<name>/` directory on the dataset's mountpoint, OR via `zfs list -t snapshot` + `zfs send`. The `cache/immich` dataset has `snapdir=hidden`, but `.zfs/snapshot/` is still listable as root over SSH — use it directly.
 - Returns: relative path within `library/`, file size, optional hash (only when explicitly requested for deep-check; full hash sweep is too expensive for routine use).
 
 ### `s3_rclone`
 
-- Lists S3 objects via the AWS SDK against the same bucket the existing `s3_backup` user script targets. Bucket name and prefix come from the rclone config + the user script — read both during the build.
+- Lists S3 objects via the AWS SDK against `wijernet-prod-backups/cache_immich` in `eu-west-1` (the destination of the Unraid `s3_backup` user script, which rclone-syncs from `/mnt/ten-tb/backup/cache_immich` — the syncoid replica of live `cache/immich`).
 - Auth via `AWS_*` env vars or `~/.aws/credentials`.
-- Returns: object key, size, ETag (S3's hash; matches MD5 for non-multipart uploads), last-modified.
+- Returns: object key, size, ETag, last-modified.
+- **SSE-KMS caveat**: the bucket has `server_side_encryption = aws:kms`, which makes S3's ETag opaque (not MD5 of the content), even for single-part uploads. Identity-tier check uses (key + size + last-modified). Hash-tier check (`trove deepcheck`) downloads the object and SHA-256s it locally — see "Verification cache" above for how repeated work is avoided.
+- **Backup chain timing**: live `cache/immich` → autosnap @ ~01:15 → syncoid (same window) → `ten-tb/backup/cache_immich` → `cron.daily` @ 04:40 → rclone sync → S3. So S3 reflects the replica state at the last rclone run, not live Immich. The 30h settling default covers this chain plus margin.
+- **Key derivation**: an Immich storage path `library/<rest>` maps to S3 key `cache_immich/library/<rest>`.
 
 ## CLI surface (v1)
 
 ```
-trove scan <storage>          refresh inventory of one storage
-trove scan --all              refresh all configured storages
-trove verify <flow>           check all assets in a flow against expected presences
-trove cleanup-report          THE v1 deliverable: print safe-to-delete asset list
-trove deepcheck <asset-id>    pull bytes from each replica, SHA-256, compare
-trove status                  summary: counts per storage, last verified, drift
+trove scan <storage>                  refresh inventory of one storage
+trove scan --all                      refresh all configured storages
+trove verify <flow> [--force]         check all assets in a flow against expected presences
+trove cleanup-report                  THE v1 deliverable: print safe-to-delete asset list
+trove deepcheck <asset-id> [--force]  pull bytes from each replica, SHA-256, compare
+trove status                          summary: counts per storage, last verified, drift
 ```
+
+`--force` on `verify` and `deepcheck` ignores the Verification cache and re-checks from scratch.
 
 All commands are idempotent. `scan` and `verify` produce no false-positive churn when re-run.
 
@@ -142,9 +189,10 @@ storages:
 
   immich_s3:
     type: s3_rclone
-    bucket: <fill in from s3_backup user script>
-    prefix: <fill in from s3_backup user script>
-    settled_after: <fill in based on s3_backup schedule>
+    bucket: wijernet-prod-backups
+    prefix: cache_immich
+    region: eu-west-1
+    settled_after: 30h
 
 flows:
   iphone_library:
@@ -169,8 +217,6 @@ flows:
 
 1. **Photos.sqlite schema stability.** Apple changes it across macOS versions. Pin the reading code behind an interface so a PhotoKit helper can swap in if direct SQLite gets too brittle. Test against the user's current macOS first.
 2. **Immich endpoint choice.** Read the OpenAPI spec; pick the cheapest endpoint that returns assets with the device-asset (PHAsset) identifier preserved. The bulk-export endpoint is probably right, but verify before committing.
-3. **`s3_backup` script semantics.** Before building the S3 adapter, read `/boot/config/plugins/user.scripts/scripts/s3_backup/script` on Unraid. Specifically: source dataset (live `cache/immich` or replicated `ten-tb/backup/cache_immich`?), bucket, prefix, schedule. The settling tolerance for the S3 replica falls out of the schedule.
-4. **`.zfs/snapshot/` accessibility over SSH.** Confirm `snapdir=visible` (or that listing via `.zfs/snapshot/<name>/` works as root over SSH). If not, fall back to `zfs list -t snapshot` + a temporary clone.
 
 ## Build constraints
 
