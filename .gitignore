@@ -1,0 +1,8 @@
+# sbp-skills manifest (machine-specific)
+.sbp/
+
+# Claude Code local config (machine-specific)
+.claude/
+
+# Local Photos.sqlite dumps — private photo metadata, never commit
+photosdb/

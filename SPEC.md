@@ -127,7 +127,10 @@ Deep checks are expensive — they download bytes from S3 (the only tier without
 
 - Reads the macOS Photos library (`~/Pictures/Photos Library.photoslibrary/database/Photos.sqlite`).
 - Returns: PHAsset identifier, original filename, capture date, file size, album memberships, **resource list** (one entry per `PHAssetResource` — type such as photo/video/alternatePhoto/pairedVideo, size, UTI).
-- **Implementation note**: try direct SQLite first — Photos.sqlite is well-documented (cf. `osxphotos`'s schema reverse-engineering). If Apple-version churn becomes a maintenance problem, swap in a small Swift PhotoKit helper behind the same interface.
+- **macOS TCC requirement**: the process must have Full Disk Access — `sudo` does not bypass TCC. On `SQLITE_CANTOPEN` / `SQLITE_AUTH`, surface a clear message directing the user to grant FDA to their terminal. See `docs/photos-sqlite.md` for details.
+- **Live Photo detection**: Live Photos are `ZASSET.ZPLAYBACKSTYLE = 3`. Their paired motion video is a separate `ZINTERNALRESOURCE` row with `ZRESOURCETYPE = 3, ZDATASTORESUBTYPE = 18`. Regular stills are `ZPLAYBACKSTYLE = 1`; standalone videos are `ZPLAYBACKSTYLE = 4`.
+- **Album join table**: the join table linking albums to assets (`Z_33ASSETS` in the current schema) uses a numeric prefix that Apple changes across macOS releases. The adapter must discover it at runtime via `sqlite_master`. See `docs/photos-sqlite.md`.
+- **Implementation note**: try direct SQLite first — schema documented in `docs/photos-sqlite.md` (reverse-engineered from a live macOS 15 library). If Apple-version churn becomes a maintenance problem, swap in a small Swift PhotoKit helper behind the same interface.
 
 ### `immich_api`
 
