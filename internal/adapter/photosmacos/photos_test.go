@@ -3,6 +3,7 @@ package photosmacos
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -25,16 +26,16 @@ type fixture struct {
 }
 
 type fixtureAsset struct {
-	pk           int64
-	uuid         string
-	filename     string
-	directory    string
-	uti          string
-	dateCreated  float64 // CoreData epoch seconds
-	playback     int
-	trashed      int
-	visibility   int
-	hidden       int
+	pk          int64
+	uuid        string
+	filename    string
+	directory   string
+	uti         string
+	dateCreated float64 // CoreData epoch seconds
+	playback    int
+	trashed     int
+	visibility  int
+	hidden      int
 }
 
 type fixtureAlbum struct {
@@ -236,7 +237,9 @@ func TestAssets_FiltersAndShape(t *testing.T) {
 	}
 
 	// Expect: STILL, LIVE, VIDEO, IN-WHATSAPP, IN-SBP — five.
-	// Excluded by the SQL: TRASHED, HIDDEN, NONVISIBLE.
+	// Excluded by the SQL: TRASHED (ZTRASHEDSTATE=1), HIDDEN (ZHIDDEN=1,
+	// deliberate policy per SPEC.md § Hidden assets are out of scope),
+	// NONVISIBLE (ZVISIBILITYSTATE!=0).
 	gotIDs := make([]string, 0, len(assets))
 	for _, a := range assets {
 		gotIDs = append(gotIDs, a.PHAssetID)
@@ -343,6 +346,32 @@ func TestExcludedAssets_TrashedAssetExcludedFromResult(t *testing.T) {
 	}
 	if _, ok := excluded["UUID-IN-WHATSAPP"]; !ok {
 		t.Error("active WhatsApp asset missing from ExcludedAssets")
+	}
+}
+
+func TestWrapError(t *testing.T) {
+	cases := []struct {
+		name    string
+		raw     string
+		wantSub string
+	}{
+		{"FDA: cannot open file", "unable to open database file", "Full Disk Access"},
+		{"FDA: authorization denied", "authorization denied", "Full Disk Access"},
+		{"Photos.app lock: database is locked", "database is locked", "Photos.app may be open"},
+		{"Photos.app lock: SQLITE_BUSY", "SQLITE_BUSY: cannot start transaction", "Photos.app may be open"},
+		{"generic falls through with op + path", "syntax error near 'FOO'", "query assets /tmp/x"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := errors.New(tc.raw)
+			got := wrapError("/tmp/x", "query assets", raw)
+			if !strings.Contains(got.Error(), tc.wantSub) {
+				t.Errorf("wrapError(%q): got %q, want substring %q", tc.raw, got.Error(), tc.wantSub)
+			}
+			if !errors.Is(got, raw) {
+				t.Errorf("wrapped error must preserve the underlying error via errors.Is; got chain: %v", got)
+			}
+		})
 	}
 }
 

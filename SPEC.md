@@ -84,6 +84,15 @@ Photos.sqlite uses WAL and may be locked when Photos.app is open. Open with `mod
 
 Immich content from before the iOS app (Lightroom export, manual web upload, etc.) has no source PHAsset identifier. For v1 these are "not bridge-matchable": a Photos.app asset will be reported "missing from Immich" even if the same bytes exist there under another upload path. SHA-256 fallback matching is a deferred extension (related to the pHash deferral noted above).
 
+### Hidden assets are out of scope
+
+Trove excludes hidden assets (`ZASSET.ZHIDDEN = 1`) from `Assets()` and therefore from cleanup-report. This is a deliberate over-filter — the auditor's instinct to keep everything in scope is overruled here for two operational reasons:
+
+- The Immich iOS app does not upload hidden assets by default. An audit that includes them would mark every hidden asset "missing from Immich" — accurate but useless, since cleanup-report could never recommend a delete and the report would be cluttered with un-actionable rows.
+- Photos.app's Hidden album is a *keep-but-segregate* signal from the user. Recommending deletion of hidden content — even when durable elsewhere — runs against the conservative "preserve, don't trim" default.
+
+The filter is one SQL clause in `photos_macos`. If the user later changes the Immich iOS app to upload hidden assets, lift the filter via config; do not loosen it silently in code.
+
 ## The cleanup-report algorithm
 
 ```
@@ -130,6 +139,7 @@ Deep checks are expensive — they download bytes from S3 (the only tier without
 - **macOS TCC requirement**: the process must have Full Disk Access — `sudo` does not bypass TCC. On `SQLITE_CANTOPEN` / `SQLITE_AUTH`, surface a clear message directing the user to grant FDA to their terminal. See `docs/photos-sqlite.md` for details.
 - **Live Photo detection**: Live Photos are `ZASSET.ZPLAYBACKSTYLE = 3`. Their paired motion video is a separate `ZINTERNALRESOURCE` row with `ZRESOURCETYPE = 3, ZDATASTORESUBTYPE = 18`. Regular stills are `ZPLAYBACKSTYLE = 1`; standalone videos are `ZPLAYBACKSTYLE = 4`.
 - **Album join table**: the join table linking albums to assets (`Z_33ASSETS` in the current schema) uses a numeric prefix that Apple changes across macOS releases. The adapter must discover it at runtime via `sqlite_master`. See `docs/photos-sqlite.md`.
+- **Hidden filter**: the adapter filters `ZHIDDEN = 0` in addition to `ZTRASHEDSTATE = 0` and `ZVISIBILITYSTATE = 0`. See § Hidden assets are out of scope for the rationale.
 - **Implementation note**: try direct SQLite first — schema documented in `docs/photos-sqlite.md` (reverse-engineered from a live macOS 15 library). If Apple-version churn becomes a maintenance problem, swap in a small Swift PhotoKit helper behind the same interface.
 
 ### `immich_api`

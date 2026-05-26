@@ -68,6 +68,8 @@ workaround; a live-WAL copy risks an inconsistent read.
 
 Active, non-trashed assets: `ZTRASHEDSTATE = 0 AND ZVISIBILITYSTATE = 0`.
 
+The `photos_macos` adapter additionally filters `ZHIDDEN = 0` — see SPEC.md § Hidden assets are out of scope for the rationale. The query sketch at the bottom of this doc reflects that filter.
+
 #### `ZPLAYBACKSTYLE` values
 
 | Value | Meaning |
@@ -242,11 +244,12 @@ pointing at `ZASSET`.
 ## Cleanup-report query sketch
 
 ```sql
--- Active, visible assets not in any excluded album
+-- Active, visible, non-hidden assets not in any excluded album
 SELECT a.ZUUID, a.ZFILENAME, a.ZDATECREATED, a.ZPLAYBACKSTYLE
 FROM ZASSET a
 WHERE a.ZTRASHEDSTATE = 0
   AND a.ZVISIBILITYSTATE = 0
+  AND a.ZHIDDEN = 0
   AND a.ZUUID NOT IN (
     SELECT a2.ZUUID
     FROM ZASSET a2

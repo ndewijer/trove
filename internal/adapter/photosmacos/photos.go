@@ -76,17 +76,17 @@ func Open(path string) (*Library, error) {
 	db.SetMaxOpenConns(1)
 	if _, err := db.Exec("PRAGMA busy_timeout = 2000"); err != nil {
 		db.Close()
-		return nil, classifyOpenError(abs, err)
+		return nil, wrapError(abs, "set busy_timeout", err)
 	}
 	if err := db.Ping(); err != nil {
 		db.Close()
-		return nil, classifyOpenError(abs, err)
+		return nil, wrapError(abs, "open", err)
 	}
-	if err := verifyPhotosSchema(db); err != nil {
+	if err := verifyPhotosSchema(db, abs); err != nil {
 		db.Close()
 		return nil, err
 	}
-	joinTable, albumCol, assetCol, err := discoverAlbumAssetJoinTable(db)
+	joinTable, albumCol, assetCol, err := discoverAlbumAssetJoinTable(db, abs)
 	if err != nil {
 		db.Close()
 		return nil, err
@@ -110,31 +110,41 @@ func (l *Library) Path() string { return l.path }
 // diagnostic logging (e.g. `trove scan photos` may print it for support).
 func (l *Library) JoinTable() string { return l.joinTable }
 
-// classifyOpenError surfaces a clear FDA hint when the OS refuses to open
-// Photos.sqlite under TCC. On a missing grant macOS surfaces the file as
-// unreadable, which SQLite reports as "unable to open database file".
-func classifyOpenError(path string, err error) error {
+// wrapError annotates a SQLite error with an actionable hint when it matches
+// a known macOS-environment failure (missing TCC grant; Photos.app holding a
+// lock on the live WAL), otherwise wraps it with operation context. Used at
+// every call site that can return a SQLite error so the hint fires during
+// queries too, not only at Open — Photos.app commonly grabs the lock between
+// Open and the first read.
+func wrapError(path, op string, err error) error {
 	msg := err.Error()
-	if strings.Contains(msg, "unable to open database file") ||
-		strings.Contains(msg, "authorization denied") {
+	switch {
+	case strings.Contains(msg, "unable to open database file"),
+		strings.Contains(msg, "authorization denied"):
 		return fmt.Errorf(
-			"photosmacos: cannot open %s — if this is inside a Photos library, grant Full Disk Access to your terminal (System Settings → Privacy & Security → Full Disk Access). underlying error: %w",
-			path, err,
+			"photosmacos: cannot %s %s — if this is inside a Photos library, grant Full Disk Access to your terminal (System Settings → Privacy & Security → Full Disk Access). underlying error: %w",
+			op, path, err,
+		)
+	case strings.Contains(msg, "database is locked"),
+		strings.Contains(msg, "SQLITE_BUSY"):
+		return fmt.Errorf(
+			"photosmacos: %s appears to be locked during %s — Photos.app may be open; please close it and retry. underlying error: %w",
+			path, op, err,
 		)
 	}
-	return fmt.Errorf("photosmacos: open %s: %w", path, err)
+	return fmt.Errorf("photosmacos: %s %s: %w", op, path, err)
 }
 
 // verifyPhotosSchema confirms the file is a Photos.sqlite by checking for
 // ZASSET. Avoids opaque "no such table" errors deeper in the call stack.
-func verifyPhotosSchema(db *sql.DB) error {
+func verifyPhotosSchema(db *sql.DB, path string) error {
 	var name string
 	err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='ZASSET'`).Scan(&name)
 	if errors.Is(err, sql.ErrNoRows) {
-		return errors.New("photosmacos: file does not look like Photos.sqlite (no ZASSET table)")
+		return fmt.Errorf("photosmacos: %s does not look like Photos.sqlite (no ZASSET table)", path)
 	}
 	if err != nil {
-		return fmt.Errorf("photosmacos: verify schema: %w", err)
+		return wrapError(path, "verify schema", err)
 	}
 	return nil
 }
@@ -152,24 +162,24 @@ var (
 // discoverAlbumAssetJoinTable finds the Z_NNASSETS table that joins
 // ZGENERICALBUM and ZASSET. Returns the table name plus its album-FK and
 // asset-FK column names. Errors when no candidate has both columns.
-func discoverAlbumAssetJoinTable(db *sql.DB) (table, albumCol, assetCol string, err error) {
+func discoverAlbumAssetJoinTable(db *sql.DB, path string) (table, albumCol, assetCol string, err error) {
 	rows, err := db.Query(`SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'Z_*ASSETS'`)
 	if err != nil {
-		return "", "", "", fmt.Errorf("photosmacos: enumerate Z_*ASSETS tables: %w", err)
+		return "", "", "", wrapError(path, "enumerate Z_*ASSETS tables", err)
 	}
 	defer rows.Close()
 	var candidates []string
 	for rows.Next() {
 		var n string
 		if err := rows.Scan(&n); err != nil {
-			return "", "", "", err
+			return "", "", "", wrapError(path, "scan Z_*ASSETS candidate", err)
 		}
 		if joinTablePattern.MatchString(n) {
 			candidates = append(candidates, n)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return "", "", "", err
+		return "", "", "", wrapError(path, "iterate Z_*ASSETS candidates", err)
 	}
 	for _, t := range candidates {
 		ac, asc, ok := columnsLookLikeAlbumAssetJoin(db, t)
@@ -178,8 +188,8 @@ func discoverAlbumAssetJoinTable(db *sql.DB) (table, albumCol, assetCol string, 
 		}
 	}
 	return "", "", "", fmt.Errorf(
-		"photosmacos: no Z_*ASSETS join table with Z_NNALBUMS / Z_NASSETS columns (candidates: %v)",
-		candidates,
+		"photosmacos: %s has no Z_*ASSETS join table with Z_NNALBUMS / Z_NASSETS columns (candidates: %v)",
+		path, candidates,
 	)
 }
 
@@ -207,8 +217,10 @@ func columnsLookLikeAlbumAssetJoin(db *sql.DB, table string) (string, string, bo
 	return albumCol, assetCol, albumCol != "" && assetCol != ""
 }
 
-// Assets enumerates active, visible, non-trashed, non-hidden assets. Resources
-// are not populated in this slice — see Asset doc.
+// Assets enumerates the auditable set: active, visible, non-trashed,
+// non-hidden assets. The ZHIDDEN = 0 filter is deliberate policy — see
+// SPEC.md § Hidden assets are out of scope. Resources are not populated in
+// this slice — see Asset doc.
 func (l *Library) Assets(ctx context.Context) ([]Asset, error) {
 	rows, err := l.db.QueryContext(ctx, `
 		SELECT ZUUID, ZFILENAME, ZDIRECTORY, ZUNIFORMTYPEIDENTIFIER,
@@ -220,7 +232,7 @@ func (l *Library) Assets(ctx context.Context) ([]Asset, error) {
 		ORDER BY Z_PK
 	`)
 	if err != nil {
-		return nil, fmt.Errorf("photosmacos: query assets: %w", err)
+		return nil, wrapError(l.path, "query assets", err)
 	}
 	defer rows.Close()
 	var out []Asset
@@ -231,7 +243,7 @@ func (l *Library) Assets(ctx context.Context) ([]Asset, error) {
 			playback                       sql.NullInt64
 		)
 		if err := rows.Scan(&uuid, &filename, &directory, &uti, &dateCreated, &playback); err != nil {
-			return nil, fmt.Errorf("photosmacos: scan asset: %w", err)
+			return nil, wrapError(l.path, "scan asset", err)
 		}
 		out = append(out, Asset{
 			PHAssetID:     uuid.String,
@@ -243,7 +255,7 @@ func (l *Library) Assets(ctx context.Context) ([]Asset, error) {
 		})
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, wrapError(l.path, "iterate assets", err)
 	}
 	return out, nil
 }
@@ -277,18 +289,18 @@ func (l *Library) ExcludedAssets(ctx context.Context, albumNames []string) (map[
 	}
 	rows, err := l.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("photosmacos: query excluded assets: %w", err)
+		return nil, wrapError(l.path, "query excluded assets", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var uuid string
 		if err := rows.Scan(&uuid); err != nil {
-			return nil, err
+			return nil, wrapError(l.path, "scan excluded asset", err)
 		}
 		out[uuid] = struct{}{}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, wrapError(l.path, "iterate excluded assets", err)
 	}
 	return out, nil
 }

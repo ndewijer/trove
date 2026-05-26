@@ -15,3 +15,20 @@ repos:
     rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e # v8.30.1
     hooks:
       - id: gitleaks
+
+  # Go: format with gofmt (rewrites in place; pre-commit fails the commit if any
+  # files were modified so the dev must re-stage) and run go vet against the
+  # whole module. Requires Go on PATH — trove won't build without it anyway.
+  - repo: local
+    hooks:
+      - id: gofmt
+        name: gofmt
+        entry: gofmt -w
+        language: system
+        types: [go]
+      - id: go-vet
+        name: go vet
+        entry: go vet ./...
+        language: system
+        types: [go]
+        pass_filenames: false
