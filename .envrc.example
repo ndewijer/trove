@@ -1,0 +1,28 @@
+# Per-machine env for trove. Copy to .envrc (gitignored) and fill in.
+# Source before running trove against real backends:
+#
+#     cp .envrc.example .envrc
+#     $EDITOR .envrc
+#     source .envrc
+#
+# (Or use direnv to source automatically when entering this directory.)
+
+# --- Immich ---------------------------------------------------------------
+# URL of your Immich server. Trailing /api is stripped automatically.
+export IMMICH_URL="https://immich.local.dewijer.nl"
+
+# Per-user API key from Immich → Account Settings → API Keys → New API Key.
+# Required scopes:
+#   - asset.read       — needed now, for `trove scan immich` to call
+#                        POST /api/search/metadata (lists all assets)
+#   - asset.download   — needed later, for `trove deepcheck` to GET
+#                        /api/assets/{id}/original (downloads bytes for
+#                        SHA-256 comparison)
+# Grant both upfront so you don't have to re-issue the key when deepcheck
+# lands. On older Immich releases (pre-1.106) API keys are all-or-nothing
+# — there's no scope picker; the key inherits your full account access.
+export IMMICH_API_KEY=""
+
+# --- Future adapters (placeholders, not yet read by trove) ----------------
+# export AWS_PROFILE="trove-readonly"   # for the s3_rclone adapter
+# export TROVE_SSH_HOST="orion.local.dewijer.nl"

@@ -9,3 +9,6 @@ photosdb/
 
 # Compiled binary from `go build ./...`
 /trove
+
+# Local secrets / per-machine env (see .envrc.example for the shape).
+.envrc
