@@ -185,6 +185,14 @@ use `ZASSET.ZPLAYBACKSTYLE = 3` — it is more reliable than probing for
 These are an internal Photos enum, not the full UTI string. For the canonical
 format string use `ZASSET.ZUNIFORMTYPEIDENTIFIER`.
 
+**`ZCOMPACTUTI` is dynamically typed.** For builtin Photos formats it stores
+a small integer enum (the table above). For extended/imported formats (e.g.
+WebP from a third-party app), Photos stores the full UTI as a `TEXT` value
+with a leading underscore, like `_org.webmproject.webp`. Readers must accept
+both shapes: switch on the Go driver value (`int64` → look up; `string` /
+`[]byte` → trim the leading underscore and use as the UTI). The adapter's
+`resolveCompactUTI` does this dispatch.
+
 #### `ZFINGERPRINT` is not SHA-256
 
 `ZFINGERPRINT` is Photos' own internal fingerprint (base64-encoded, ~28 chars).

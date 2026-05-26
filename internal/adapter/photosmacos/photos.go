@@ -34,10 +34,34 @@ const (
 	PlaybackSlowMotion PlaybackStyle = 5
 )
 
+// ResourceType identifies the four canonical original resources the adapter
+// surfaces. Derivatives (thumbnails, compressed Live-motion variants, JPEG
+// previews, edit-base copies) are filtered at the SQL layer because they're
+// reproducible and not part of any cross-tier durability check. See SPEC.md
+// § photos_macos adapter for the locked contract.
+type ResourceType int
+
+const (
+	ResourcePhoto          ResourceType = 0  // still original (HEIC/JPEG), ZDATASTORESUBTYPE=1
+	ResourceVideo          ResourceType = 1  // standalone video original (MOV/MP4), ZDATASTORESUBTYPE=1
+	ResourceLiveMotion     ResourceType = 3  // Live Photo paired motion (MOV), ZDATASTORESUBTYPE=18
+	ResourceAlternatePhoto ResourceType = 13 // RAW DNG in RAW+JPEG pairs, ZDATASTORESUBTYPE=1
+)
+
+// Resource represents one canonical original file inside a PHAsset.
+type Resource struct {
+	Type        ResourceType
+	DataLength  int64  // ZDATALENGTH bytes (per-resource — multi-resource assets have no single size)
+	UTI         string // resolved from ZCOMPACTUTI; empty when the compact code is unmapped
+	Fingerprint string // ZFINGERPRINT — Photos-internal change-detection signal, NOT SHA-256
+}
+
 // Asset represents one PHAsset (one photo or video) at the adapter boundary.
-// Resources are not populated by this slice — that lands in a follow-up
-// commit so cleanup-report can verify Live motion / RAW alternate / video
-// originals independently.
+// Resources is the list of canonical originals (still, video, Live motion,
+// RAW alternate) — derivatives are filtered out. An asset with an empty
+// Resources slice has no canonical originals materialised locally; this is
+// expected when iCloud Photos "Optimise Mac Storage" has not downloaded the
+// original yet. Cleanup-report must treat such assets as not-yet-durable.
 type Asset struct {
 	PHAssetID     string // ZUUID — the bridge identifier to Immich
 	Filename      string
@@ -45,6 +69,7 @@ type Asset struct {
 	UTI           string
 	CaptureDate   time.Time
 	PlaybackStyle PlaybackStyle
+	Resources     []Resource
 }
 
 // Library is an open handle on Photos.sqlite.
@@ -218,12 +243,23 @@ func columnsLookLikeAlbumAssetJoin(db *sql.DB, table string) (string, string, bo
 }
 
 // Assets enumerates the auditable set: active, visible, non-trashed,
-// non-hidden assets. The ZHIDDEN = 0 filter is deliberate policy — see
-// SPEC.md § Hidden assets are out of scope. Resources are not populated in
-// this slice — see Asset doc.
+// non-hidden assets, each populated with its canonical original resources.
+// The ZHIDDEN = 0 filter is deliberate policy — see SPEC.md § Hidden assets
+// are out of scope.
+//
+// Implementation: two queries — ZASSET, then a single ZINTERNALRESOURCE
+// query that joins ZASSET so it inherits the same active-visible-non-hidden
+// filter and a SQL-level WHERE that retains only canonical (type, subtype)
+// pairs. Resources are bucketed by ZASSET.Z_PK and attached to each Asset
+// in a final pass; Z_PK never leaks past the package boundary.
 func (l *Library) Assets(ctx context.Context) ([]Asset, error) {
+	type assetRow struct {
+		pk    int64
+		asset Asset
+	}
+
 	rows, err := l.db.QueryContext(ctx, `
-		SELECT ZUUID, ZFILENAME, ZDIRECTORY, ZUNIFORMTYPEIDENTIFIER,
+		SELECT Z_PK, ZUUID, ZFILENAME, ZDIRECTORY, ZUNIFORMTYPEIDENTIFIER,
 		       ZDATECREATED, ZPLAYBACKSTYLE
 		FROM ZASSET
 		WHERE ZTRASHEDSTATE = 0
@@ -235,29 +271,131 @@ func (l *Library) Assets(ctx context.Context) ([]Asset, error) {
 		return nil, wrapError(l.path, "query assets", err)
 	}
 	defer rows.Close()
-	var out []Asset
+	var rowsBuf []assetRow
 	for rows.Next() {
 		var (
+			pk                             int64
 			uuid, filename, directory, uti sql.NullString
 			dateCreated                    sql.NullFloat64
 			playback                       sql.NullInt64
 		)
-		if err := rows.Scan(&uuid, &filename, &directory, &uti, &dateCreated, &playback); err != nil {
+		if err := rows.Scan(&pk, &uuid, &filename, &directory, &uti, &dateCreated, &playback); err != nil {
 			return nil, wrapError(l.path, "scan asset", err)
 		}
-		out = append(out, Asset{
-			PHAssetID:     uuid.String,
-			Filename:      filename.String,
-			Directory:     directory.String,
-			UTI:           uti.String,
-			CaptureDate:   coreDataDate(dateCreated),
-			PlaybackStyle: PlaybackStyle(playback.Int64),
+		rowsBuf = append(rowsBuf, assetRow{
+			pk: pk,
+			asset: Asset{
+				PHAssetID:     uuid.String,
+				Filename:      filename.String,
+				Directory:     directory.String,
+				UTI:           uti.String,
+				CaptureDate:   coreDataDate(dateCreated),
+				PlaybackStyle: PlaybackStyle(playback.Int64),
+			},
 		})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, wrapError(l.path, "iterate assets", err)
 	}
+
+	resByAsset, err := l.loadCanonicalResources(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]Asset, len(rowsBuf))
+	for i, ar := range rowsBuf {
+		a := ar.asset
+		a.Resources = resByAsset[ar.pk]
+		out[i] = a
+	}
 	return out, nil
+}
+
+// loadCanonicalResources returns canonical originals for the auditable asset
+// set (active, visible, non-hidden, non-trashed), keyed by ZASSET.Z_PK.
+// The (type, subtype) pairs that count as "canonical" are the four documented
+// in docs/photos-sqlite.md § Identifying resources for durability checking:
+// still photo (0/1), standalone video (1/1), Live Photo motion full-quality
+// (3/18), RAW alternate (13/1). Everything else — thumbnails, compressed
+// Live-motion variants, JPEG previews, edit-base copies — is excluded at the
+// SQL layer.
+func (l *Library) loadCanonicalResources(ctx context.Context) (map[int64][]Resource, error) {
+	rows, err := l.db.QueryContext(ctx, `
+		SELECT r.ZASSET, r.ZRESOURCETYPE, r.ZDATALENGTH, r.ZFINGERPRINT, r.ZCOMPACTUTI
+		FROM ZINTERNALRESOURCE r
+		JOIN ZASSET a ON a.Z_PK = r.ZASSET
+		WHERE r.ZTRASHEDSTATE = 0
+		  AND a.ZTRASHEDSTATE = 0
+		  AND a.ZVISIBILITYSTATE = 0
+		  AND a.ZHIDDEN = 0
+		  AND (
+		    (r.ZRESOURCETYPE = 0 AND r.ZDATASTORESUBTYPE = 1)
+		    OR (r.ZRESOURCETYPE = 1 AND r.ZDATASTORESUBTYPE = 1)
+		    OR (r.ZRESOURCETYPE = 3 AND r.ZDATASTORESUBTYPE = 18)
+		    OR (r.ZRESOURCETYPE = 13 AND r.ZDATASTORESUBTYPE = 1)
+		  )
+		ORDER BY r.ZASSET, r.ZRESOURCETYPE
+	`)
+	if err != nil {
+		return nil, wrapError(l.path, "query resources", err)
+	}
+	defer rows.Close()
+
+	out := make(map[int64][]Resource)
+	for rows.Next() {
+		var (
+			assetPK     int64
+			rType       sql.NullInt64
+			dataLength  sql.NullInt64
+			fingerprint sql.NullString
+			compactUTI  any // INTEGER for builtin Photos codes, TEXT for extended UTIs
+		)
+		if err := rows.Scan(&assetPK, &rType, &dataLength, &fingerprint, &compactUTI); err != nil {
+			return nil, wrapError(l.path, "scan resource", err)
+		}
+		out[assetPK] = append(out[assetPK], Resource{
+			Type:        ResourceType(rType.Int64),
+			DataLength:  dataLength.Int64,
+			UTI:         resolveCompactUTI(compactUTI),
+			Fingerprint: fingerprint.String,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, wrapError(l.path, "iterate resources", err)
+	}
+	return out, nil
+}
+
+// resolveCompactUTI converts a ZINTERNALRESOURCE.ZCOMPACTUTI cell into a UTI
+// string. The column is dynamically typed: builtin Photos formats use a
+// small integer enum (1=jpeg, 3=heic, 6=mpeg-4, 23=quicktime — see
+// docs/photos-sqlite.md § ZCOMPACTUTI values observed), but extended UTIs
+// (e.g. WebP) come through as TEXT with a leading underscore
+// ("_org.webmproject.webp"). Unmapped integers and unrecognised types
+// return "" so callers can distinguish "unknown" from a real UTI.
+func resolveCompactUTI(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case int64:
+		switch x {
+		case 1:
+			return "public.jpeg"
+		case 3:
+			return "public.heic"
+		case 6:
+			return "public.mpeg-4"
+		case 23:
+			return "com.apple.quicktime-movie"
+		}
+		return ""
+	case string:
+		return strings.TrimPrefix(x, "_")
+	case []byte:
+		return strings.TrimPrefix(string(x), "_")
+	}
+	return ""
 }
 
 // ExcludedAssets returns the PHAsset identifiers (ZUUID) of all assets that

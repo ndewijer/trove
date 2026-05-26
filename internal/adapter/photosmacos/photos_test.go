@@ -23,6 +23,7 @@ type fixture struct {
 	assets         []fixtureAsset
 	albums         []fixtureAlbum
 	memberships    []fixtureMembership
+	resources      []fixtureResource
 }
 
 type fixtureAsset struct {
@@ -48,6 +49,16 @@ type fixtureAlbum struct {
 type fixtureMembership struct {
 	albumPK int64
 	assetPK int64
+}
+
+type fixtureResource struct {
+	assetPK     int64
+	rType       int // ZRESOURCETYPE
+	subtype     int // ZDATASTORESUBTYPE
+	dataLength  int64
+	fingerprint string
+	compactUTI  int
+	trashed     int
 }
 
 func buildPhotosSQLite(t *testing.T, f fixture) string {
@@ -84,6 +95,16 @@ func buildPhotosSQLite(t *testing.T, f fixture) string {
 			"Z_%dALBUMS" INTEGER,
 			"Z_%dASSETS" INTEGER
 		)`, f.joinPrefix, f.joinPrefix, f.assetColPrefix),
+		`CREATE TABLE ZINTERNALRESOURCE (
+			Z_PK INTEGER PRIMARY KEY,
+			ZASSET INTEGER,
+			ZRESOURCETYPE INTEGER,
+			ZDATASTORESUBTYPE INTEGER,
+			ZDATALENGTH INTEGER,
+			ZFINGERPRINT TEXT,
+			ZCOMPACTUTI INTEGER,
+			ZTRASHEDSTATE INTEGER
+		)`,
 	}
 	for _, s := range stmts {
 		if _, err := db.Exec(s); err != nil {
@@ -123,6 +144,19 @@ func buildPhotosSQLite(t *testing.T, f fixture) string {
 			t.Fatalf("insert membership: %v", err)
 		}
 	}
+	for _, r := range f.resources {
+		_, err := db.Exec(`
+			INSERT INTO ZINTERNALRESOURCE
+			(ZASSET, ZRESOURCETYPE, ZDATASTORESUBTYPE, ZDATALENGTH,
+			 ZFINGERPRINT, ZCOMPACTUTI, ZTRASHEDSTATE)
+			VALUES (?,?,?,?,?,?,?)`,
+			r.assetPK, r.rType, r.subtype, r.dataLength,
+			r.fingerprint, r.compactUTI, r.trashed,
+		)
+		if err != nil {
+			t.Fatalf("insert resource (asset %d, type %d): %v", r.assetPK, r.rType, err)
+		}
+	}
 	return path
 }
 
@@ -154,6 +188,20 @@ func baseFixture(joinPrefix, assetColPrefix int) fixture {
 			{albumPK: 100, assetPK: 7}, // UUID-IN-WHATSAPP in WhatsApp
 			{albumPK: 101, assetPK: 8}, // UUID-IN-SBP in SBP
 			{albumPK: 102, assetPK: 1}, // UUID-STILL also in Family (not excluded)
+		},
+		resources: []fixtureResource{
+			// Canonical originals — what the adapter must surface.
+			{assetPK: 1, rType: 0, subtype: 1, dataLength: 1_000_000, fingerprint: "fp-still", compactUTI: 3},         // UUID-STILL: HEIC
+			{assetPK: 2, rType: 0, subtype: 1, dataLength: 800_000, fingerprint: "fp-live-still", compactUTI: 3},      // UUID-LIVE: HEIC
+			{assetPK: 2, rType: 3, subtype: 18, dataLength: 5_000_000, fingerprint: "fp-live-motion", compactUTI: 23}, // UUID-LIVE: motion MOV
+			{assetPK: 3, rType: 1, subtype: 1, dataLength: 20_000_000, fingerprint: "fp-video", compactUTI: 23},       // UUID-VIDEO: MOV
+			{assetPK: 7, rType: 0, subtype: 1, dataLength: 500_000, fingerprint: "fp-whatsapp", compactUTI: 1},        // UUID-IN-WHATSAPP: JPEG
+			{assetPK: 8, rType: 0, subtype: 1, dataLength: 600_000, fingerprint: "fp-sbp", compactUTI: 1},             // UUID-IN-SBP: JPEG
+			// Noise that the adapter must filter out, exercised implicitly by every Assets() test:
+			{assetPK: 1, rType: 14, subtype: 5, dataLength: 50_000, compactUTI: 36},                               // thumbnail → drop
+			{assetPK: 2, rType: 3, subtype: 7, dataLength: 1_500_000, compactUTI: 24},                             // compressed Live motion derivative → drop
+			{assetPK: 3, rType: 1, subtype: 4, dataLength: 2_000_000, compactUTI: 1},                              // JPEG preview of the video → drop
+			{assetPK: 7, rType: 0, subtype: 1, dataLength: 500_000, fingerprint: "fp-whatsapp-stale", trashed: 1}, // trashed canonical → drop
 		},
 	}
 }
@@ -273,6 +321,147 @@ func TestAssets_FiltersAndShape(t *testing.T) {
 	}
 }
 
+func TestAssets_CanonicalResourcesPerAsset(t *testing.T) {
+	path := buildPhotosSQLite(t, baseFixture(33, 3))
+	lib, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer lib.Close()
+
+	assets, err := lib.Assets(context.Background())
+	if err != nil {
+		t.Fatalf("Assets: %v", err)
+	}
+
+	// Each expectation is the canonical-resource shape baseFixture seeds.
+	// Noise (thumbnails, derivatives, trashed resources, non-canonical Live
+	// motion subtype) MUST be excluded — these exact-match shapes lock the
+	// SQL-level filter in loadCanonicalResources.
+	want := map[string][]Resource{
+		"UUID-STILL": {
+			{Type: ResourcePhoto, DataLength: 1_000_000, UTI: "public.heic", Fingerprint: "fp-still"},
+		},
+		"UUID-LIVE": {
+			{Type: ResourcePhoto, DataLength: 800_000, UTI: "public.heic", Fingerprint: "fp-live-still"},
+			{Type: ResourceLiveMotion, DataLength: 5_000_000, UTI: "com.apple.quicktime-movie", Fingerprint: "fp-live-motion"},
+		},
+		"UUID-VIDEO": {
+			{Type: ResourceVideo, DataLength: 20_000_000, UTI: "com.apple.quicktime-movie", Fingerprint: "fp-video"},
+		},
+		"UUID-IN-WHATSAPP": {
+			{Type: ResourcePhoto, DataLength: 500_000, UTI: "public.jpeg", Fingerprint: "fp-whatsapp"},
+		},
+		"UUID-IN-SBP": {
+			{Type: ResourcePhoto, DataLength: 600_000, UTI: "public.jpeg", Fingerprint: "fp-sbp"},
+		},
+	}
+	for uuid, expected := range want {
+		got := findAsset(assets, uuid)
+		if got == nil {
+			t.Errorf("%s: not in results", uuid)
+			continue
+		}
+		if !equalResources(got.Resources, expected) {
+			t.Errorf("%s resources mismatch:\n  got:  %+v\n  want: %+v", uuid, got.Resources, expected)
+		}
+	}
+}
+
+func TestAssets_RAWPlusJPEGCarriesAlternate(t *testing.T) {
+	f := baseFixture(33, 3)
+	f.assets = append(f.assets, fixtureAsset{
+		pk: 20, uuid: "UUID-RAWJPEG", filename: "IMG_RAW.JPG",
+		uti: "public.jpeg", dateCreated: 700100000, playback: 1,
+	})
+	f.resources = append(f.resources,
+		fixtureResource{assetPK: 20, rType: 0, subtype: 1, dataLength: 4_000_000, fingerprint: "fp-rawjpeg-jpeg", compactUTI: 1},
+		fixtureResource{assetPK: 20, rType: 13, subtype: 1, dataLength: 40_000_000, fingerprint: "fp-rawjpeg-raw", compactUTI: 7},
+	)
+	path := buildPhotosSQLite(t, f)
+	lib, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer lib.Close()
+
+	assets, err := lib.Assets(context.Background())
+	if err != nil {
+		t.Fatalf("Assets: %v", err)
+	}
+	a := findAsset(assets, "UUID-RAWJPEG")
+	if a == nil {
+		t.Fatal("UUID-RAWJPEG not found")
+	}
+	want := []Resource{
+		{Type: ResourcePhoto, DataLength: 4_000_000, UTI: "public.jpeg", Fingerprint: "fp-rawjpeg-jpeg"},
+		{Type: ResourceAlternatePhoto, DataLength: 40_000_000, UTI: "", Fingerprint: "fp-rawjpeg-raw"}, // compactUTI=7 is unmapped
+	}
+	if !equalResources(a.Resources, want) {
+		t.Errorf("UUID-RAWJPEG resources mismatch:\n  got:  %+v\n  want: %+v", a.Resources, want)
+	}
+}
+
+func TestAssets_ICloudOptimizedHasEmptyResources(t *testing.T) {
+	// Asset present but no canonical original locally — only a thumbnail
+	// (the iCloud Photos "Optimise Storage" state). Adapter must return
+	// the asset with Resources == nil so cleanup-report can treat it as
+	// not-yet-durable rather than silently dropping it.
+	f := baseFixture(33, 3)
+	f.assets = append(f.assets, fixtureAsset{
+		pk: 30, uuid: "UUID-ICLOUD-OPT", filename: "IMG_REMOTE.HEIC",
+		uti: "public.heic", dateCreated: 700200000, playback: 1,
+	})
+	f.resources = append(f.resources, fixtureResource{
+		assetPK: 30, rType: 14, subtype: 5, dataLength: 30_000, compactUTI: 36, // thumbnail only
+	})
+	path := buildPhotosSQLite(t, f)
+	lib, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer lib.Close()
+
+	assets, err := lib.Assets(context.Background())
+	if err != nil {
+		t.Fatalf("Assets: %v", err)
+	}
+	a := findAsset(assets, "UUID-ICLOUD-OPT")
+	if a == nil {
+		t.Fatal("UUID-ICLOUD-OPT was filtered out — adapter must surface iCloud-optimised assets so cleanup-report can mark them not-yet-durable")
+	}
+	if len(a.Resources) != 0 {
+		t.Errorf("UUID-ICLOUD-OPT should have zero canonical resources, got %d: %+v", len(a.Resources), a.Resources)
+	}
+}
+
+func TestResolveCompactUTI(t *testing.T) {
+	cases := []struct {
+		name string
+		in   any
+		want string
+	}{
+		{"int 1 → jpeg", int64(1), "public.jpeg"},
+		{"int 3 → heic", int64(3), "public.heic"},
+		{"int 6 → mpeg-4", int64(6), "public.mpeg-4"},
+		{"int 23 → quicktime", int64(23), "com.apple.quicktime-movie"},
+		{"int 7 (documented unknown) → empty", int64(7), ""},
+		{"unmapped int → empty", int64(999), ""},
+		{"nil → empty", nil, ""},
+		{"string underscore-prefixed extended UTI", "_org.webmproject.webp", "org.webmproject.webp"},
+		{"string bare UTI passes through", "public.heic", "public.heic"},
+		{"[]byte underscore-prefixed extended UTI", []byte("_public.jpeg"), "public.jpeg"},
+		{"unknown type → empty", 1.5, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveCompactUTI(tc.in); got != tc.want {
+				t.Errorf("resolveCompactUTI(%v %T) = %q, want %q", tc.in, tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestExcludedAssets_FoundAndMissingAlbums(t *testing.T) {
 	path := buildPhotosSQLite(t, baseFixture(33, 3))
 	lib, err := Open(path)
@@ -387,6 +576,27 @@ func TestCoreDataDate_UnixConversion(t *testing.T) {
 	if !got.IsZero() {
 		t.Errorf("coreDataDate(NULL) = %v, want zero", got)
 	}
+}
+
+func findAsset(assets []Asset, uuid string) *Asset {
+	for i := range assets {
+		if assets[i].PHAssetID == uuid {
+			return &assets[i]
+		}
+	}
+	return nil
+}
+
+func equalResources(got, want []Resource) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func equal(a, b []string) bool {

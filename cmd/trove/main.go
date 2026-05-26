@@ -131,19 +131,33 @@ func scanPhotos(stdout, stderr io.Writer, libraryFlag string) int {
 		return 1
 	}
 
-	counts := map[photosmacos.PlaybackStyle]int{}
+	playback := map[photosmacos.PlaybackStyle]int{}
+	resources := map[photosmacos.ResourceType]int{}
+	noOriginal := 0
 	for _, a := range assets {
-		counts[a.PlaybackStyle]++
+		playback[a.PlaybackStyle]++
+		if len(a.Resources) == 0 {
+			noOriginal++
+		}
+		for _, r := range a.Resources {
+			resources[r.Type]++
+		}
 	}
 	fmt.Fprintln(stdout, "trove scan photos")
 	fmt.Fprintf(stdout, "  library:       %s\n", lib.Path())
 	fmt.Fprintf(stdout, "  join table:    %s\n", lib.JoinTable())
 	fmt.Fprintf(stdout, "  active assets: %d\n", len(assets))
-	fmt.Fprintf(stdout, "    stills:       %d\n", counts[photosmacos.PlaybackStill])
-	fmt.Fprintf(stdout, "    animated:     %d\n", counts[photosmacos.PlaybackAnimated])
-	fmt.Fprintf(stdout, "    live photos:  %d\n", counts[photosmacos.PlaybackLivePhoto])
-	fmt.Fprintf(stdout, "    videos:       %d\n", counts[photosmacos.PlaybackVideo])
-	fmt.Fprintf(stdout, "    slow-motion:  %d\n", counts[photosmacos.PlaybackSlowMotion])
+	fmt.Fprintf(stdout, "    stills:       %d\n", playback[photosmacos.PlaybackStill])
+	fmt.Fprintf(stdout, "    animated:     %d\n", playback[photosmacos.PlaybackAnimated])
+	fmt.Fprintf(stdout, "    live photos:  %d\n", playback[photosmacos.PlaybackLivePhoto])
+	fmt.Fprintf(stdout, "    videos:       %d\n", playback[photosmacos.PlaybackVideo])
+	fmt.Fprintf(stdout, "    slow-motion:  %d\n", playback[photosmacos.PlaybackSlowMotion])
+	fmt.Fprintln(stdout, "  canonical resources surfaced:")
+	fmt.Fprintf(stdout, "    photo originals:        %d\n", resources[photosmacos.ResourcePhoto])
+	fmt.Fprintf(stdout, "    video originals:        %d\n", resources[photosmacos.ResourceVideo])
+	fmt.Fprintf(stdout, "    live-motion originals:  %d\n", resources[photosmacos.ResourceLiveMotion])
+	fmt.Fprintf(stdout, "    raw alternates:         %d\n", resources[photosmacos.ResourceAlternatePhoto])
+	fmt.Fprintf(stdout, "  assets without canonical originals (iCloud-optimised or download-pending): %d\n", noOriginal)
 	return 0
 }
 

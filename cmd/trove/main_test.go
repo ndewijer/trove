@@ -2,8 +2,12 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	_ "modernc.org/sqlite"
 )
 
 func TestRun(t *testing.T) {
@@ -148,4 +152,77 @@ func TestRun(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestScanPhotos_HappyPath(t *testing.T) {
+	path := writeMinimalPhotosSqlite(t)
+
+	var stdout, stderr bytes.Buffer
+	exit := run([]string{"scan", "--library", path, "photos"}, &stdout, &stderr)
+	if exit != 0 {
+		t.Fatalf("exit %d; stderr=%q", exit, stderr.String())
+	}
+	for _, want := range []string{
+		"trove scan photos",
+		"library:",
+		"join table:    Z_33ASSETS",
+		"active assets: 2",
+		"canonical resources surfaced:",
+		"photo originals:        2",
+		"live-motion originals:  1",
+		"assets without canonical originals",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("stdout missing %q\ngot:\n%s", want, stdout.String())
+		}
+	}
+}
+
+// writeMinimalPhotosSqlite builds the smallest Photos.sqlite the CLI happy
+// path needs: a still + a Live Photo (with paired motion). Mirrors the
+// adapter test fixture's shape — kept inline to avoid exporting test helpers
+// from internal/adapter/photosmacos.
+func writeMinimalPhotosSqlite(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "Photos.sqlite")
+
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open fixture: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	stmts := []string{
+		`CREATE TABLE ZASSET (
+			Z_PK INTEGER PRIMARY KEY, ZUUID TEXT, ZFILENAME TEXT, ZDIRECTORY TEXT,
+			ZUNIFORMTYPEIDENTIFIER TEXT, ZDATECREATED REAL, ZPLAYBACKSTYLE INTEGER,
+			ZTRASHEDSTATE INTEGER, ZVISIBILITYSTATE INTEGER, ZHIDDEN INTEGER
+		)`,
+		`CREATE TABLE ZGENERICALBUM (Z_PK INTEGER PRIMARY KEY, ZTITLE TEXT, ZKIND INTEGER, ZTRASHEDSTATE INTEGER)`,
+		`CREATE TABLE "Z_33ASSETS" ("Z_33ALBUMS" INTEGER, "Z_3ASSETS" INTEGER)`,
+		`CREATE TABLE ZINTERNALRESOURCE (
+			Z_PK INTEGER PRIMARY KEY, ZASSET INTEGER, ZRESOURCETYPE INTEGER,
+			ZDATASTORESUBTYPE INTEGER, ZDATALENGTH INTEGER, ZFINGERPRINT TEXT,
+			ZCOMPACTUTI INTEGER, ZTRASHEDSTATE INTEGER
+		)`,
+		// Explicit 0s on ZTRASHEDSTATE/ZVISIBILITYSTATE/ZHIDDEN — the
+		// adapter's WHERE clause is `= 0`, and NULL would fail that match.
+		`INSERT INTO ZASSET (Z_PK, ZUUID, ZFILENAME, ZPLAYBACKSTYLE, ZTRASHEDSTATE, ZVISIBILITYSTATE, ZHIDDEN)
+		 VALUES (1, 'UUID-STILL', 'IMG_1.HEIC', 1, 0, 0, 0)`,
+		`INSERT INTO ZASSET (Z_PK, ZUUID, ZFILENAME, ZPLAYBACKSTYLE, ZTRASHEDSTATE, ZVISIBILITYSTATE, ZHIDDEN)
+		 VALUES (2, 'UUID-LIVE',  'IMG_2.HEIC', 3, 0, 0, 0)`,
+		`INSERT INTO ZINTERNALRESOURCE (ZASSET, ZRESOURCETYPE, ZDATASTORESUBTYPE, ZDATALENGTH, ZCOMPACTUTI, ZTRASHEDSTATE)
+		 VALUES (1, 0, 1, 1000000, 3, 0)`,
+		`INSERT INTO ZINTERNALRESOURCE (ZASSET, ZRESOURCETYPE, ZDATASTORESUBTYPE, ZDATALENGTH, ZCOMPACTUTI, ZTRASHEDSTATE)
+		 VALUES (2, 0, 1, 900000, 3, 0)`,
+		`INSERT INTO ZINTERNALRESOURCE (ZASSET, ZRESOURCETYPE, ZDATASTORESUBTYPE, ZDATALENGTH, ZCOMPACTUTI, ZTRASHEDSTATE)
+		 VALUES (2, 3, 18, 5000000, 23, 0)`,
+	}
+	for _, s := range stmts {
+		if _, err := db.Exec(s); err != nil {
+			t.Fatalf("setup: %v\nSQL: %s", err, s)
+		}
+	}
+	return path
 }
