@@ -7,6 +7,9 @@
 # Local Photos.sqlite dumps — private photo metadata, never commit
 photosdb/
 
+# Immich iOS app export SQLite — private photo metadata, never commit
+immichdb/
+
 # Compiled binary from `go build ./...`
 /trove
 

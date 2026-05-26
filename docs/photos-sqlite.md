@@ -1,5 +1,15 @@
 # Photos.sqlite — Schema reference for the `photos_macos` adapter
 
+> **Status (2026-05-26): the `photos_macos` adapter is DEFERRED.** Validation
+> against real data revealed three load-bearing assumptions to be wrong, and
+> the Immich iOS app's exported SQLite turned out to be a strictly better
+> source for trove v1. See SPEC.md § Storage adapters and
+> `docs/immich-iphone-export.md`. This document is preserved for the eventual
+> revival of the adapter (e.g. when Mac-only assets become in-scope) and as
+> a record of the schema research.
+>
+> Corrections from validation are inlined below as **CORRECTION** callouts.
+
 Source: direct inspection of a live `Photos.sqlite` dump (macOS 15, ~30k asset
 library, 16,496 Live Photos confirmed).
 
@@ -51,8 +61,9 @@ workaround; a live-WAL copy risks an inconsistent read.
 
 | Column | Type | Notes |
 |--------|------|-------|
-| `ZUUID` | VARCHAR | **PHAsset identifier** — primary bridge to Immich |
-| `ZFILENAME` | VARCHAR | Original filename (e.g. `IMG_0042.HEIC`) |
+| `ZUUID` | VARCHAR | iOS PHAsset.localIdentifier on this Mac. **CORRECTION**: this is per-device. The same iCloud asset has a different `ZUUID` on Mac vs iPhone (validated: 0 overlap in the reference library). For cross-device matching use `ZCLOUDASSETGUID` (see below). |
+| `ZCLOUDASSETGUID` | VARCHAR | **iCloud-stable asset GUID.** Populated for 95.6% of assets in the reference library. Matches the prefix of `local_asset_entity.i_cloud_id` in the Immich iPhone export — the actual Mac↔phone bridge. |
+| `ZFILENAME` | VARCHAR | **CORRECTION**: this is Photos.app's *internal storage filename* (typically `<UUID>.heic`), not the original filename. The original lives in `ZADDITIONALASSETATTRIBUTES.ZORIGINALFILENAME`. |
 | `ZDIRECTORY` | VARCHAR | Relative directory within the library |
 | `ZUNIFORMTYPEIDENTIFIER` | VARCHAR | UTI string (`public.heic`, `public.jpeg`, `com.apple.quicktime-movie`) |
 | `ZDATECREATED` | TIMESTAMP | CoreData epoch — seconds since Jan 1 2001 UTC (not Unix epoch) |
@@ -200,6 +211,20 @@ It is useful as a cheap change-detection signal but must not be compared against
 Immich's `checksum` field. Deep-check SHA-256 must be computed by downloading
 the actual bytes from the replica.
 
+#### `ZADDITIONALASSETATTRIBUTES.ZORIGINALSTABLEHASH` is Apple's hash, NOT SHA-1
+
+**CORRECTION**: An obvious candidate for a Mac → Immich direct bridge — every
+asset has a 28-char base64-shaped `ZORIGINALSTABLEHASH` — but it is **not** a
+SHA-1 of the bytes. Validated: zero matches against Immich's base64-SHA-1
+`checksum` field, both directly and after every plausible
+encoding/padding transform. The Apple value typically starts with `A`,
+contains no `=` padding, and appears to encode 21 bytes (vs SHA-1's 20).
+Likely an Apple-internal content-stable identifier with a 1-byte prefix.
+
+For an exact byte-hash bridge to Immich, the Immich iPhone export's
+`local_asset_entity.checksum` (real base64-SHA-1) is the path of least
+resistance — see `docs/immich-iphone-export.md`.
+
 ---
 
 ### `ZGENERICALBUM` — albums and folders
@@ -281,3 +306,20 @@ versions — column additions are common, join-table prefix changes (`Z_NN`) occ
 across major releases. The adapter must be implemented behind an interface so a
 PhotoKit-based helper can replace the SQLite path if direct reading becomes
 unmaintainable. See `SPEC.md § photos_macos adapter`.
+
+---
+
+## Validation summary (2026-05-26)
+
+Validation against the user's real library revealed:
+
+| Bridge attempt from Mac Photos.sqlite | Matches |
+|---|---|
+| `ZUUID` → Immich `deviceAssetId` prefix | **0** (per-device localIdentifier) |
+| `ZFILENAME` → Immich filename | **0** (ZFILENAME is internal storage name) |
+| `ZORIGINALFILENAME` → Immich filename | ~5,036 / 30,584 (16%) |
+| `ZORIGINALSTABLEHASH` → Immich checksum | **0** (different hash algorithm) |
+| `ZCLOUDASSETGUID` → phone DB `i_cloud_id` prefix | **29,227 / 30,584** (95.6%) |
+
+The only bridge that works at scale is via the phone DB. The Mac side becomes
+useful only for Mac-only assets (~1,357 not in the phone DB) — deferred for v1.

@@ -2,6 +2,24 @@
 
 > A read-only librarian that audits whether each photo is durably present across the user's existing backup chain, so photos can be deleted from Photos.app/iCloud with confidence.
 
+## Architecture pivot (2026-05-26)
+
+The v1 design was originally **Mac Photos.sqlite-centric**: trove would read the user's Mac Photos library and bridge to Immich via PHAsset identifier and filename heuristics. Validation against the user's real library disproved three load-bearing assumptions:
+
+1. **`PHAsset.localIdentifier` is per-device, not iCloud-synced.** Same iCloud asset gets a different UUID on Mac vs iPhone. The UUID-prefix bridge from Mac to Immich (which stores iPhone-side identifiers) yields zero matches.
+2. **`Photos.sqlite.ZFILENAME` is the *internal storage* filename (`<UUID>.heic`),** not the original. Even the corrected `ZADDITIONALASSETATTRIBUTES.ZORIGINALFILENAME` only overlaps 16% with the iOS app's view of filenames for the same library.
+3. **Mac's `ZORIGINALSTABLEHASH` is an Apple-internal content identifier,** not SHA-1; doesn't match Immich's `checksum` directly.
+
+Validation against the user's library showed the **only bridge that works at scale is via the Immich iOS app's exported SQLite** — its `local_asset_entity.checksum` (base64 SHA-1) equi-joins exactly with `remote_asset_entity.checksum` (also base64 SHA-1) inside the export. Ground truth: **21,120 PHAsset → Immich-asset matches** on a 30,584-asset library, indistinguishable from the iOS app's own dedup pass.
+
+**v1 is therefore phone-DB-centric**:
+- Source of truth for "what's in the iPhone library and in scope": Immich iOS app SQLite export (manual, semi-annual)
+- Source of truth for "what's already in Immich": same export's `remote_asset_entity`, plus the live Immich REST API for `originalPath`
+- Bridge: checksum equi-join inside the phone DB. No filename heuristics, no UUID inference.
+- The `photos_macos` adapter (commits 28b6f32 → 39039fe) is **shelved** — code stays in git history, marked deferred. Mac-only assets (~1,357 in the reference library) are out of v1 scope.
+
+See `docs/immich-iphone-export.md` for the schema and `docs/photos-sqlite.md` for the corrected Mac-side reference.
+
 ## Origin
 
 In 2006 the user lost years of photos and email to a hardware failure. Email recovered (SaaS); photos didn't. Year zero for the user's photo archive is 2006.
@@ -30,7 +48,8 @@ The output is a list of PHAsset identifiers the user can confidently delete from
 
 ## Architecture
 
-- **Single Go binary** running on the user's Mac. The Mac is the only host with Photos.sqlite, the rclone S3 credentials, and (later) Backblaze visibility.
+- **Single Go binary** running on the user's Mac. The Mac is the host, not the data source — the bulk of the audit reads from the Immich iOS app's exported SQLite (manually dropped in by the user) plus the live Immich REST API plus remote replicas.
+- **Phone DB export** at a configured path (default: `~/Library/Application Support/trove/data/immich_export_*.sqlite`). User exports periodically from the Immich iOS app.
 - **State**: SQLite at `~/Library/Application Support/trove/state.db`, WAL mode. CGO-free via `modernc.org/sqlite`.
 - **Config**: YAML at `~/Library/Application Support/trove/config.yaml` or `--config`.
 - **Credentials**: env vars or macOS keychain. Never inline in config.
@@ -45,15 +64,17 @@ The output is a list of PHAsset identifiers the user can confidently delete from
 
 ## Identity & matching
 
-The matching primitive between tiers is **exact identifier**, not byte hash, wherever possible:
+The matching primitive between tiers is **byte hash (SHA-1)** — promoted from the original "exact identifier" design after validation showed PHAsset.localIdentifier is per-device and cross-device identifier matching from Mac to Immich yields zero coverage.
 
 | From | To | Bridge |
 |---|---|---|
-| Photos.app | Immich | PHAsset identifier — the Immich iOS app stores it on every uploaded asset |
+| iOS Photos (via phone DB) | Immich | `local_asset_entity.checksum` (base64 SHA-1, computed by the iOS app at import) equi-joins with `remote_asset_entity.checksum` (also base64 SHA-1). Exact equality. |
 | Immich | zfs snapshot | Storage path — Immich's library lives at `cache/immich/library/...`; the snapshot has the same relative path |
 | Immich | S3 | S3 key — derived from the storage path and the `s3_backup` script's source/prefix |
 
-SHA-256 is used for **deep-check** (`trove deepcheck`) and for **periodic spot audits** — opt-in or sampled, not on every run. Expected hash is sourced from Immich (it computes one on import).
+The phone-DB SHA-1 is computed on the iPhone, the Immich SHA-1 is computed on the server at upload — they match because they hash the same bytes. The "Immich uses SHA-1, trove deepcheck uses SHA-256" mismatch noted in earlier drafts is real but doesn't affect this bridge: the SHA-1 → SHA-1 equality holds end-to-end on the bridge axis. SHA-256 is reserved for `trove deepcheck` which verifies replicas against each other independently.
+
+**iCloud-optimised assets** (PHAsset present but original bytes not on device) have `local_asset_entity.checksum IS NULL` and cannot be bridged via this path. Default v1 verdict: indeterminate, never safe-to-delete. Fallbacks (filename+size match, download originals + re-export) are deferred extensions.
 
 Perceptual hash (pHash) is **deferred**. Add it only when we hit a real "same photo, different bytes" cross-tier divergence.
 
@@ -95,24 +116,36 @@ The filter is one SQL clause in `photos_macos`. If the user later changes the Im
 
 ## The cleanup-report algorithm
 
+Rewritten around the phone-DB-centric bridge.
+
 ```
-For each asset A in Photos.sqlite:
-  If A is in any Immich-excluded album (e.g. WhatsApp, Reinvent, Animated, SBP, DJI Album):
-    skip — DELIBERATELY not in Immich; never eligible for cleanup
-  If A.PHAssetID not in Immich asset list, OR the matched Immich asset is in state `trashed`:
-    report: "missing from Immich" — not safe
-  Enumerate Photos resources R for A (still, motion, RAW, JPEG, etc. — Photos is source of truth)
-  For each resource r in R:
-    Find r's counterpart in Immich (matched by resource type / pairing convention)
-    If counterpart missing in Immich:
-      report: "Immich missing resource <type>" — not safe; stop checking other resources
-    Verify counterpart's storage path exists in cache/immich snapshot S where (now - S.timestamp) ≥ settling[snapshot]
-    Verify counterpart (or its derived S3 key) exists in S3 where (now - object.last_modified) ≥ settling[s3]
-  If all checks pass:
-    A is "safe to delete from Photos.app"
-  Else:
-    A is "not yet durable" with explicit reasons
+1. Read phone-DB local_album_entity. The audit scope is:
+     in-scope = members of any album with backup_selection = 0     (user-selected)
+              − members of any album with backup_selection = 2     (user-excluded — WhatsApp, Reinvent, etc.)
+   (System albums with backup_selection = 1 are never in scope.)
+
+2. For each in-scope local_asset_entity row L:
+     If L.checksum IS NULL:
+       report "indeterminate — iCloud-optimised, original not on device" — not safe
+       continue
+     Find remote_asset_entity R where R.checksum = L.checksum (and matching owner_id):
+       If none: report "missing from Immich" — not safe
+       If R.deleted_at IS NOT NULL OR R.visibility ∈ {hidden, locked}: report "not present in Immich (trashed/hidden/locked)" — not safe
+
+3. For each matched R:
+     Query Immich REST API for originalPath (the phone DB doesn't carry it)
+     Verify originalPath exists in cache/immich snapshot S where (now - S.timestamp) ≥ settling[snapshot]
+     Verify derived S3 key exists in S3 where (now - object.last_modified) ≥ settling[s3]
+   If all replicas verified:
+     L is "safe to delete from Photos.app"
+   Else:
+     L is "not yet durable" with the missing replicas named
 ```
+
+Notes vs the earlier design:
+- **No multi-resource enumeration step.** The phone DB tracks one row per PHAsset, not per resource. Live Photo motion videos appear as separate `remote_asset_entity` rows linked via `live_photo_video_id`; if that link is intact and both halves bridge to Immich, the asset is durable. The detailed resource model from § Resource model and edge cases still applies but is enforced by the iOS app's upload logic rather than re-validated by trove.
+- **Visibility policy is local to cleanup-report,** matching SPEC § Immich asset states: `timeline` and `archive` count as present; `hidden`, `locked`, and `deleted_at IS NOT NULL` count as not-present.
+- **Settling tolerance** still mandatory on snapshot and S3 replicas — see CLAUDE.md hard rule #4.
 
 Default settling tolerances:
 - snapshot replica: ≥ 22h (covers one autosnap + syncoid cycle at ~01:15)
@@ -132,9 +165,24 @@ Deep checks are expensive — they download bytes from S3 (the only tier without
 
 ## Storage adapters (v1)
 
-### `photos_macos`
+### `immich_phone_export` (v1 primary source)
 
-- Reads the macOS Photos library (`~/Pictures/Photos Library.photoslibrary/database/Photos.sqlite`).
+- Reads the SQLite file the Immich iOS app exports (Settings → … → Export DB). User AirDrops it to Mac periodically (semi-annual cadence acceptable for historical cleanup).
+- **Returns per asset**: `id` (iOS PHAsset.localIdentifier — per-device, but stable within this DB), `name` (filename), `checksum` (base64 SHA-1, the bridge to Immich), `i_cloud_id` (iCloud-stable UUID prefix, for future Mac↔phone correlation), album memberships via `local_album_asset_entity`, backup_selection per album.
+- **Album scope**: read `local_album_entity.backup_selection` directly. `0` = selected, `1` = system/not-selected, `2` = explicitly excluded. Replaces the manually-maintained exclusion list in earlier drafts.
+- **Indeterminate verdict**: PHAssets with `checksum IS NULL` (iCloud-optimised, original not on device) cannot be bridged via this adapter. Default v1 behaviour: report as indeterminate, never safe-to-delete.
+- **Staleness**: the export is a snapshot. Trove must warn (or refuse) if the file's mtime is older than a threshold — recommended default 30 days, hard fail at 6 months.
+- See `docs/immich-iphone-export.md` for the schema reference and the validation results.
+
+### `photos_macos` (DEFERRED — not on v1 critical path)
+
+> Code lives in `internal/adapter/photosmacos/` (commits 28b6f32 → 39039fe) and remains buildable, but is not invoked by `trove cleanup-report`. It survives in `trove scan photos` for diagnostic use against the Mac Photos library; the matching results don't bridge to Immich.
+
+Reason for deferral: see § Architecture pivot above. The Mac Photos.sqlite cannot bridge to Immich at scale (per-device localIdentifier, wrong filename field, Apple-internal stable hash that isn't SHA-1). Resurrect when:
+- Mac-only assets (~1,357 in the reference library — imported to Mac without iCloud sync to phone) become in-scope, or
+- A PhotoKit Swift helper replaces the SQLite reader and exposes `cloudIdentifier` / SHA-1 directly.
+
+#### Preserved adapter spec for revival
 - **Returns per asset**: PHAsset identifier (`ZUUID`), original filename, directory, asset UTI, capture date (CoreData → Unix converted), playback style (still / animated / Live Photo / video / slow-motion), and a list of canonical-original resources.
 - **Returns per resource**: type (one of `Photo`, `Video`, `LiveMotion`, `AlternatePhoto` — the four canonical originals), per-resource size (`ZDATALENGTH`, in bytes), resource UTI (resolved from `ZCOMPACTUTI`, empty when unmapped), and Photos' internal fingerprint (`ZFINGERPRINT`, useful for change-detection but **not** a SHA-256). Derivatives — thumbnails (`ZRESOURCETYPE=14`), compressed Live-motion variants (`3/6`, `3/7`), JPEG previews of videos, edit-base copies — are filtered at the SQL layer and never surface; the cleanup-report algorithm has no use for them.
 - **Per-asset size is intentionally absent.** A multi-resource asset (Live Photo, RAW+JPEG) has no single "size" — callers that need a number must sum or pick per-resource.
@@ -149,6 +197,7 @@ Deep checks are expensive — they download bytes from S3 (the only tier without
 ### `immich_api`
 
 - Talks to the Immich REST API. Spec: `https://docs.immich.app/api` → published reference at `https://api.immich.app`.
+- **Role under the v1 pivot**: provides `originalPath` per Immich asset id (the phone DB doesn't carry path), used downstream for snapshot/S3 verification. The bulk-list endpoint is also still useful for `trove scan immich` diagnostics independent of the phone-DB bridge.
 - **Auth header**: `x-api-key: <key>`. Key sourced from env (default `IMMICH_API_KEY`) or keychain — never inline in config.
 - **Bulk endpoint**: `POST /api/search/metadata` with body `{page, size, withDeleted: true, withStacked: true, withExif: false, withPeople: false}`. The adapter does NOT set a `visibility` filter, so timeline / archive / hidden / locked assets all surface; the caller (cleanup-report) decides which classes count as "present" (default: timeline + archive present; hidden, locked, `isTrashed: true` not-present, per § Immich asset states).
 - **Pagination**: incrementing `page=1, 2, …` with `size=1000`, driven by the wrapper's `nextPage` field — a *string-encoded* page number, or `null` on the last page. The wrapper's `total` and `count` are per-page values in Immich 2.x (verified against 2.7.5, not the lifetime total the api.immich.app reference suggested), so `nextPage` is the only authoritative terminator. The client also fails fast if a server returns `nextPage <= currentPage`, which would otherwise spin forever.
@@ -193,9 +242,14 @@ All commands are idempotent. `scan` and `verify` produce no false-positive churn
 
 ```yaml
 storages:
-  photos:
-    type: photos_macos
-    library_path: ~/Pictures/Photos Library.photoslibrary
+  iphone:
+    type: immich_phone_export
+    # Path to the Immich iOS app's exported SQLite. Glob accepted —
+    # newest matching file wins.
+    export_path: ~/Library/Application Support/trove/data/immich_export_*.sqlite
+    # Warn if the export is older than this; refuse if much older.
+    staleness_warn: 30d
+    staleness_fail: 180d
 
   immich:
     type: immich_api
@@ -219,27 +273,28 @@ storages:
 
 flows:
   iphone_library:
-    source: photos
-    exclude_albums:
-      # Mirrors the Immich iOS app exclude list — must stay in sync with the app
-      - WhatsApp
-      - Reinvent
-      - Animated
-      - SBP
-      - DJI Album
+    source: iphone
+    # Album scope read from the phone DB's local_album_entity.backup_selection.
+    # No manual include/exclude list needed — the iOS app's own policy is
+    # authoritative. If the user wants to override, they can list albums
+    # here that will be additionally excluded regardless of backup_selection.
+    extra_exclude_albums: []
     replicas:
       - storage: immich
-        bind: phasset_id
+        bind: checksum                     # phone DB SHA-1 → Immich SHA-1
       - storage: immich_snapshot
-        bind: immich_path
+        bind: immich_path                  # via Immich originalPath
       - storage: immich_s3
-        bind: immich_path
+        bind: immich_path                  # via Immich originalPath
 ```
 
 ## Open questions for the builder
 
-1. **Photos.sqlite schema stability.** Apple changes it across macOS versions. Pin the reading code behind an interface so a PhotoKit helper can swap in if direct SQLite gets too brittle. Test against the user's current macOS first.
-2. **Immich endpoint choice.** Read the OpenAPI spec; pick the cheapest endpoint that returns assets with the device-asset (PHAsset) identifier preserved. The bulk-export endpoint is probably right, but verify before committing.
+1. **iCloud-optimised assets without local checksum.** In the reference library, 8,841 PHAssets have no local SHA-1 (originals not on the device). Cleanup-report options: (a) indeterminate, never safe-to-delete (recommended default — conservative); (b) fall back to filename+size match against Immich `exifInfo.fileSizeInByte`; (c) prompt the user to download originals and re-export. Lock the choice before shipping.
+2. **Phone DB staleness thresholds.** Default warn=30d, fail=180d are guesses based on the 24h backup-chain settling window. Validate against the user's real export cadence.
+3. **Owner scoping.** The phone DB's `remote_asset_entity` includes shared-library and partner content (e.g. a wife's Android-uploaded photos). The bridge query should restrict matches to `owner_id == auth_user_entity.id` so cleanup-report only considers the user's own assets, not their partner's.
+4. **Mac-only assets.** ~1,357 in the reference library — imported to Mac without iCloud sync to phone. Out of v1 scope. Revisit when `photos_macos` is revived.
+5. **Phone DB schema versioning.** Inspected against Immich iOS app 2.7.5 (`user_version=22` in the SQLite header). The adapter should fail loudly on an unrecognised schema version rather than silently mis-reading.
 
 ## Build constraints
 
@@ -253,21 +308,23 @@ flows:
 ## Layout sketch
 
 ```
-cmd/trove/             main, CLI dispatch
-internal/store/        SQLite schema + queries
-internal/model/        Asset, Storage, Presence, Flow
-internal/adapter/      one package per adapter type
-  photosmacos/
-  immichapi/
-  sshzfs/
-  s3rclone/
-internal/flow/         flow evaluation, settling logic, cleanup-report
-internal/config/       YAML loading + validation
+cmd/trove/                       main, CLI dispatch
+internal/store/                  SQLite schema + queries (state DB)
+internal/model/                  Asset, Storage, Presence, Flow
+internal/adapter/
+  immichphoneexport/   (v1)      reads the iOS app's SQLite export — source of truth
+  immichapi/           (v1)      Immich REST — originalPath + scan diagnostics
+  sshzfs/              (v1)      ZFS snapshot adapter
+  s3rclone/            (v1)      S3 adapter
+  photosmacos/         (deferred — Mac-only assets, not on the v1 path)
+internal/flow/                   flow evaluation, settling logic, cleanup-report
+internal/config/                 YAML loading + validation
 ```
 
 ## What success looks like for v1
 
-- `trove scan --all` populates the state DB with everything from Photos.app, Immich, the latest settled snapshot, and S3.
-- `trove verify iphone_library` reports zero unexpected drift (after exclusions are tuned to match reality).
-- `trove cleanup-report` returns a list of N PHAsset identifiers. The user spot-checks 5 of them with `trove deepcheck`, sees clean SHA-256 matches across all three replicas, and feels safe deleting them in Photos.app.
+- The user exports the Immich iOS app SQLite, AirDrops it to Mac, drops it in the configured path.
+- `trove scan iphone` reports the in-scope set (per `local_album_entity.backup_selection`), bridged-to-Immich count (checksum equi-join), and indeterminate count (iCloud-optimised). Numbers ballpark the iOS app's own "Backup / Remainder" view.
+- `trove scan immich`, `trove scan immich_snapshot`, `trove scan immich_s3` report each replica's inventory.
+- `trove cleanup-report` returns a list of N PHAsset identifiers proven durable across (Immich + snapshot + S3). The user spot-checks 5 with `trove deepcheck` (SHA-256 against replica bytes), confirms, and deletes them in Photos.app.
 - Nothing has been moved, copied, or modified anywhere outside trove's own SQLite.

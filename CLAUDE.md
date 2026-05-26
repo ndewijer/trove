@@ -33,7 +33,7 @@ The full design lives in `SPEC.md`. Read it before making non-trivial changes.
 
 1. **Never add a mover.** If a feature would have trove copy, sync, or replicate bytes, that's the wrong layer. Redirect: it belongs in Lightroom config, syncoid policy, the rclone user script, or Backblaze settings.
 2. **Never propose deleting from a tier without verifying durability.** Cleanup recommendations must be hash- or path-verified against every configured replica, with settling tolerance respected. Don't infer "probably synced by now."
-3. **Mirror Immich's exclusion list exactly.** Photos in excluded albums (current list: WhatsApp, Reinvent, Animated, SBP, DJI Album) are deliberately not in Immich. They are never eligible for cleanup-report. If the user changes the iOS app's exclusion list, the trove config must change too.
+3. **The Immich iOS app's `backup_selection` is authoritative for audit scope.** The phone-DB export's `local_album_entity.backup_selection` enum (`0`=selected, `1`=system, `2`=excluded) IS the iOS app's own policy. Trove reads it directly — no parallel exclusion list to maintain manually. (The current set of `2`-flagged albums is WhatsApp, Reinvent, Animated, SBP, DJI Album; that's the iOS app's state, not a trove config.)
 4. **Settling tolerance is mandatory on async replicas.** The full chain takes ~24h to settle (autosnap + syncoid + S3 sync). Don't flag drift inside that window.
 5. **Read-only outside trove's own state DB.** Adapters never write to Photos.app, Immich, the Unraid box, or S3.
 
