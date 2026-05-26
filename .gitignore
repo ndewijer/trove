@@ -6,3 +6,6 @@
 
 # Local Photos.sqlite dumps — private photo metadata, never commit
 photosdb/
+
+# Compiled binary from `go build ./...`
+/trove
