@@ -70,10 +70,16 @@ func TestRun(t *testing.T) {
 			wantStderrSub: "--all conflicts with positional",
 		},
 		{
-			name:          "scan with storage exits 1 (not implemented yet)",
-			args:          []string{"scan", "photos"},
+			name:          "scan with unknown storage exits 1 (not implemented yet)",
+			args:          []string{"scan", "immich"},
 			wantExit:      1,
-			wantStderrSub: "trove scan photos: not implemented yet",
+			wantStderrSub: "trove scan immich: not implemented yet",
+		},
+		{
+			name:          "scan photos with bad --library exits 1 with adapter error",
+			args:          []string{"scan", "--library", "/no/such/Photos.sqlite", "photos"},
+			wantExit:      1,
+			wantStderrSub: "trove scan photos:",
 		},
 		{
 			name:          "verify with no flow exits 2",

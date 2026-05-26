@@ -3,10 +3,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+
+	"github.com/ndewijer/trove/internal/adapter/photosmacos"
 )
 
 func main() {
@@ -64,7 +68,6 @@ func newFlagSet(name string, stderr io.Writer) *flag.FlagSet {
 }
 
 func runScan(args []string, stdout, stderr io.Writer) int {
-	_ = stdout
 	fs := newFlagSet("scan", stderr)
 	all := fs.Bool("all", false, "refresh all configured storages")
 	// --config default (~/Library/Application Support/trove/config.yaml) is
@@ -72,6 +75,10 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 	// empty flag value meaning "use default" without depending on
 	// os.UserHomeDir at parse time. Same contract in every subcommand below.
 	cfgPath := fs.String("config", "", "path to config.yaml")
+	library := fs.String("library", "",
+		"override Photos.sqlite path (only used by 'scan photos'; "+
+			"default: ~/Pictures/Photos Library.photoslibrary/database/Photos.sqlite). "+
+			"Must appear before the positional <storage>.")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -89,8 +96,63 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "trove scan: missing <storage> (or pass --all)")
 		return 2
 	}
-	fmt.Fprintf(stderr, "trove scan %s: not implemented yet\n", fs.Arg(0))
-	return 1
+
+	storage := fs.Arg(0)
+	switch storage {
+	case "photos":
+		return scanPhotos(stdout, stderr, *library)
+	default:
+		fmt.Fprintf(stderr, "trove scan %s: not implemented yet\n", storage)
+		return 1
+	}
+}
+
+func scanPhotos(stdout, stderr io.Writer, libraryFlag string) int {
+	path := libraryFlag
+	if path == "" {
+		p, err := defaultPhotosLibraryPath()
+		if err != nil {
+			fmt.Fprintf(stderr, "trove scan photos: resolve default library path: %v\n", err)
+			return 1
+		}
+		path = p
+	}
+
+	lib, err := photosmacos.Open(path)
+	if err != nil {
+		fmt.Fprintf(stderr, "trove scan photos: %v\n", err)
+		return 1
+	}
+	defer lib.Close()
+
+	assets, err := lib.Assets(context.Background())
+	if err != nil {
+		fmt.Fprintf(stderr, "trove scan photos: %v\n", err)
+		return 1
+	}
+
+	counts := map[photosmacos.PlaybackStyle]int{}
+	for _, a := range assets {
+		counts[a.PlaybackStyle]++
+	}
+	fmt.Fprintln(stdout, "trove scan photos")
+	fmt.Fprintf(stdout, "  library:       %s\n", lib.Path())
+	fmt.Fprintf(stdout, "  join table:    %s\n", lib.JoinTable())
+	fmt.Fprintf(stdout, "  active assets: %d\n", len(assets))
+	fmt.Fprintf(stdout, "    stills:       %d\n", counts[photosmacos.PlaybackStill])
+	fmt.Fprintf(stdout, "    animated:     %d\n", counts[photosmacos.PlaybackAnimated])
+	fmt.Fprintf(stdout, "    live photos:  %d\n", counts[photosmacos.PlaybackLivePhoto])
+	fmt.Fprintf(stdout, "    videos:       %d\n", counts[photosmacos.PlaybackVideo])
+	fmt.Fprintf(stdout, "    slow-motion:  %d\n", counts[photosmacos.PlaybackSlowMotion])
+	return 0
+}
+
+func defaultPhotosLibraryPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "Pictures", "Photos Library.photoslibrary", "database", "Photos.sqlite"), nil
 }
 
 func runVerify(args []string, stdout, stderr io.Writer) int {
