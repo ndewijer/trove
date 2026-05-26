@@ -148,9 +148,13 @@ Deep checks are expensive — they download bytes from S3 (the only tier without
 
 ### `immich_api`
 
-- Talks to the Immich REST API. Read the OpenAPI spec at `https://immich.app/docs/api`.
-- Auth via `IMMICH_API_KEY` env var.
-- Returns: Immich asset id, source PHAsset identifier (from device-asset metadata), storage path, sha1/sha256 hash, original filename.
+- Talks to the Immich REST API. Spec: `https://docs.immich.app/api` → published reference at `https://api.immich.app`.
+- **Auth header**: `x-api-key: <key>`. Key sourced from env (default `IMMICH_API_KEY`) or keychain — never inline in config.
+- **Bulk endpoint**: `POST /api/search/metadata` with body `{page, size, withDeleted: true, withStacked: true, withExif: false, withPeople: false}`. The adapter does NOT set a `visibility` filter, so timeline / archive / hidden / locked assets all surface; the caller (cleanup-report) decides which classes count as "present" (default: timeline + archive present; hidden, locked, `isTrashed: true` not-present, per § Immich asset states).
+- **Pagination**: incrementing `page=1, 2, …` with `size=1000`, driven by the wrapper's `nextPage` field — a *string-encoded* page number, or `null` on the last page. The wrapper's `total` and `count` are per-page values in Immich 2.x (verified against 2.7.5, not the lifetime total the api.immich.app reference suggested), so `nextPage` is the only authoritative terminator. The client also fails fast if a server returns `nextPage <= currentPage`, which would otherwise spin forever.
+- **Visibility wire values are lowercase** (`"timeline"`, `"archive"`, `"hidden"`, `"locked"`) — the api.immich.app reference shows them uppercase but the running server emits lowercase; the adapter's constants match the wire so direct equality works.
+- **Returns per asset**: Immich UUID (`id`), `deviceAssetId` (PHAsset bridge — equals `ZUUID` for assets uploaded via the iOS app, unrelated for other upload paths), `deviceId`, `originalFileName`, `originalPath` (path inside Immich's `library/` directory), `originalMimeType`, `checksum` (base64-encoded SHA-1 — **not** SHA-256; recorded as `ChecksumSHA1Base64` to keep that explicit), `type` (`IMAGE`/`VIDEO`/`AUDIO`/`OTHER`), `visibility` (`TIMELINE`/`ARCHIVE`/`HIDDEN`/`LOCKED`), `isTrashed`/`isArchived`/`isFavorite`, `livePhotoVideoId` (empty when the asset has no paired motion), `libraryId`, `fileCreatedAt`, `fileModifiedAt`.
+- **Checksum caveat**: Immich's `checksum` is SHA-1, while `trove deepcheck` SHA-256s downloaded bytes. The two hashes are incomparable — Immich-side identity matching uses (deviceAssetId | filename | path), not hash equality.
 
 ### `ssh_zfs_snapshot`
 

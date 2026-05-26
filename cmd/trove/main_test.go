@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -75,15 +78,21 @@ func TestRun(t *testing.T) {
 		},
 		{
 			name:          "scan with unknown storage exits 1 (not implemented yet)",
-			args:          []string{"scan", "immich"},
+			args:          []string{"scan", "ssh_zfs_snapshot"},
 			wantExit:      1,
-			wantStderrSub: "trove scan immich: not implemented yet",
+			wantStderrSub: "trove scan ssh_zfs_snapshot: not implemented yet",
 		},
 		{
 			name:          "scan photos with bad --library exits 1 with adapter error",
 			args:          []string{"scan", "--library", "/no/such/Photos.sqlite", "photos"},
 			wantExit:      1,
 			wantStderrSub: "trove scan photos:",
+		},
+		{
+			name:          "scan immich without --immich-url exits 2",
+			args:          []string{"scan", "immich"},
+			wantExit:      2,
+			wantStderrSub: "--immich-url is required",
 		},
 		{
 			name:          "verify with no flow exits 2",
@@ -225,4 +234,79 @@ func writeMinimalPhotosSqlite(t *testing.T) string {
 		}
 	}
 	return path
+}
+
+func TestScanImmich_HappyPath(t *testing.T) {
+	// Fake an Immich server with two pages of metadata, including a
+	// trashed asset and one with a non-empty deviceAssetId.
+	page1 := []map[string]any{
+		{"id": "id-A", "deviceAssetId": "phasset-A", "originalFileName": "A.HEIC", "type": "IMAGE", "visibility": "timeline"},
+		{"id": "id-B", "deviceAssetId": "phasset-B", "originalFileName": "B.MOV", "type": "VIDEO", "visibility": "archive"},
+	}
+	page2 := []map[string]any{
+		{"id": "id-C", "deviceAssetId": "", "originalFileName": "C.HEIC", "type": "IMAGE", "visibility": "timeline", "isTrashed": true},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/search/metadata" || r.Method != http.MethodPost {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		if r.Header.Get("x-api-key") != "test-key" {
+			http.Error(w, "bad key", http.StatusUnauthorized)
+			return
+		}
+		var body struct {
+			Page int `json:"page"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		var (
+			items    []map[string]any
+			nextPage any
+		)
+		switch body.Page {
+		case 1:
+			items = page1
+			nextPage = "2"
+		case 2:
+			items = page2
+			nextPage = nil
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"assets": map[string]any{
+				"total":    len(items),
+				"count":    len(items),
+				"nextPage": nextPage,
+				"items":    items,
+			},
+			"albums": map[string]any{"total": 0, "count": 0, "nextPage": nil, "items": []any{}},
+		})
+	}))
+	defer srv.Close()
+
+	t.Setenv("IMMICH_API_KEY_TEST", "test-key")
+
+	var stdout, stderr bytes.Buffer
+	exit := run([]string{"scan",
+		"--immich-url", srv.URL,
+		"--immich-api-key-env", "IMMICH_API_KEY_TEST",
+		"immich",
+	}, &stdout, &stderr)
+	if exit != 0 {
+		t.Fatalf("exit %d; stderr=%q", exit, stderr.String())
+	}
+	for _, want := range []string{
+		"trove scan immich",
+		"server:",
+		"total assets:  3",
+		"images:      2",
+		"videos:      1",
+		"timeline:    2",
+		"archive:     1",
+		"trashed (isTrashed=true):    1",
+		"with PHAsset bridge id:      2", // C has empty deviceAssetId
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("stdout missing %q\ngot:\n%s", want, stdout.String())
+		}
+	}
 }

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/ndewijer/trove/internal/adapter/immichapi"
 	"github.com/ndewijer/trove/internal/adapter/photosmacos"
 )
 
@@ -79,6 +80,11 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		"override Photos.sqlite path (only used by 'scan photos'; "+
 			"default: ~/Pictures/Photos Library.photoslibrary/database/Photos.sqlite). "+
 			"Must appear before the positional <storage>.")
+	immichURL := fs.String("immich-url", "",
+		"Immich server URL (only used by 'scan immich'). "+
+			"Trailing /api is stripped automatically.")
+	immichKeyEnv := fs.String("immich-api-key-env", "IMMICH_API_KEY",
+		"name of the env var holding the Immich API key (only used by 'scan immich').")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -101,6 +107,8 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 	switch storage {
 	case "photos":
 		return scanPhotos(stdout, stderr, *library)
+	case "immich":
+		return scanImmich(stdout, stderr, *immichURL, *immichKeyEnv)
 	default:
 		fmt.Fprintf(stderr, "trove scan %s: not implemented yet\n", storage)
 		return 1
@@ -158,6 +166,65 @@ func scanPhotos(stdout, stderr io.Writer, libraryFlag string) int {
 	fmt.Fprintf(stdout, "    live-motion originals:  %d\n", resources[photosmacos.ResourceLiveMotion])
 	fmt.Fprintf(stdout, "    raw alternates:         %d\n", resources[photosmacos.ResourceAlternatePhoto])
 	fmt.Fprintf(stdout, "  assets without canonical originals (iCloud-optimised or download-pending): %d\n", noOriginal)
+	return 0
+}
+
+func scanImmich(stdout, stderr io.Writer, urlFlag, keyEnvName string) int {
+	if urlFlag == "" {
+		fmt.Fprintln(stderr, "trove scan immich: --immich-url is required")
+		return 2
+	}
+	apiKey := os.Getenv(keyEnvName)
+	if apiKey == "" {
+		fmt.Fprintf(stderr, "trove scan immich: env %s is empty — set your Immich API key there (or override the var name with --immich-api-key-env)\n", keyEnvName)
+		return 2
+	}
+
+	c, err := immichapi.Open(urlFlag, apiKey)
+	if err != nil {
+		fmt.Fprintf(stderr, "trove scan immich: %v\n", err)
+		return 1
+	}
+	defer c.Close()
+
+	assets, err := c.Assets(context.Background())
+	if err != nil {
+		fmt.Fprintf(stderr, "trove scan immich: %v\n", err)
+		return 1
+	}
+
+	visibility := map[immichapi.Visibility]int{}
+	types := map[immichapi.AssetType]int{}
+	var trashed, bridged, livePaired int
+	for _, a := range assets {
+		visibility[a.Visibility]++
+		types[a.Type]++
+		if a.IsTrashed {
+			trashed++
+		}
+		if a.DeviceAssetID != "" {
+			bridged++
+		}
+		if a.LivePhotoVideoID != "" {
+			livePaired++
+		}
+	}
+	fmt.Fprintln(stdout, "trove scan immich")
+	fmt.Fprintf(stdout, "  server:        %s\n", c.URL())
+	fmt.Fprintf(stdout, "  total assets:  %d\n", len(assets))
+	fmt.Fprintln(stdout, "  by type:")
+	fmt.Fprintf(stdout, "    images:      %d\n", types[immichapi.TypeImage])
+	fmt.Fprintf(stdout, "    videos:      %d\n", types[immichapi.TypeVideo])
+	fmt.Fprintf(stdout, "    audio:       %d\n", types[immichapi.TypeAudio])
+	fmt.Fprintf(stdout, "    other:       %d\n", types[immichapi.TypeOther])
+	fmt.Fprintln(stdout, "  by visibility:")
+	fmt.Fprintf(stdout, "    timeline:    %d\n", visibility[immichapi.VisibilityTimeline])
+	fmt.Fprintf(stdout, "    archive:     %d\n", visibility[immichapi.VisibilityArchive])
+	fmt.Fprintf(stdout, "    hidden:      %d\n", visibility[immichapi.VisibilityHidden])
+	fmt.Fprintf(stdout, "    locked:      %d\n", visibility[immichapi.VisibilityLocked])
+	fmt.Fprintf(stdout, "  trashed (isTrashed=true):    %d\n", trashed)
+	fmt.Fprintf(stdout, "  with PHAsset bridge id:      %d  (of %d total; the rest were uploaded by paths other than the iOS app)\n", bridged, len(assets))
+	fmt.Fprintf(stdout, "  Live Photo pairs:            %d  (stills with livePhotoVideoId pointing at their motion asset)\n", livePaired)
 	return 0
 }
 
