@@ -9,6 +9,7 @@
 
 # --- Immich ---------------------------------------------------------------
 # URL of your Immich server. Trailing /api is stripped automatically.
+# `trove scan immich` reads this when --immich-url is not passed.
 export IMMICH_URL="https://immich.local.dewijer.nl"
 
 # Per-user API key from Immich → Account Settings → API Keys → New API Key.

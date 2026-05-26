@@ -162,9 +162,18 @@ func TestAssets_PaginatesAcrossNextPageChain(t *testing.T) {
 
 	// Verify the bridge field, checksum, and visibility came through intact.
 	wantIDs := []string{"phasset-A", "phasset-B", "phasset-C", "phasset-D", "phasset-E"}
+	wantChecksums := []string{"ck-A", "ck-B", "ck-C", "ck-D", "ck-E"}
 	for i, want := range wantIDs {
 		if got[i].DeviceAssetID != want {
 			t.Errorf("got[%d].DeviceAssetID = %q, want %q", i, got[i].DeviceAssetID, want)
+		}
+		// Lock that JSON `checksum` lands on the explicitly-named
+		// ChecksumSHA1Base64 field. Immich's checksum is SHA-1 (base64),
+		// not the SHA-256 (hex) trove deepcheck will compute — the field
+		// name is the contract that prevents future cross-tier comparison
+		// from silently doing the wrong thing.
+		if got[i].ChecksumSHA1Base64 != wantChecksums[i] {
+			t.Errorf("got[%d].ChecksumSHA1Base64 = %q, want %q", i, got[i].ChecksumSHA1Base64, wantChecksums[i])
 		}
 	}
 

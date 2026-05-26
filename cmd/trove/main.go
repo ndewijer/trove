@@ -9,6 +9,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 
 	"github.com/ndewijer/trove/internal/adapter/immichapi"
 	"github.com/ndewijer/trove/internal/adapter/photosmacos"
@@ -170,8 +172,15 @@ func scanPhotos(stdout, stderr io.Writer, libraryFlag string) int {
 }
 
 func scanImmich(stdout, stderr io.Writer, urlFlag, keyEnvName string) int {
-	if urlFlag == "" {
-		fmt.Fprintln(stderr, "trove scan immich: --immich-url is required")
+	url := urlFlag
+	if url == "" {
+		// Fall back to IMMICH_URL env (set by .envrc) so the documented
+		// scaffolding actually delivers what it promises — without this,
+		// users would have to type --immich-url $IMMICH_URL on every run.
+		url = os.Getenv("IMMICH_URL")
+	}
+	if url == "" {
+		fmt.Fprintln(stderr, "trove scan immich: --immich-url is required (or set IMMICH_URL in env)")
 		return 2
 	}
 	apiKey := os.Getenv(keyEnvName)
@@ -180,7 +189,7 @@ func scanImmich(stdout, stderr io.Writer, urlFlag, keyEnvName string) int {
 		return 2
 	}
 
-	c, err := immichapi.Open(urlFlag, apiKey)
+	c, err := immichapi.Open(url, apiKey)
 	if err != nil {
 		fmt.Fprintf(stderr, "trove scan immich: %v\n", err)
 		return 1
@@ -195,15 +204,20 @@ func scanImmich(stdout, stderr io.Writer, urlFlag, keyEnvName string) int {
 
 	visibility := map[immichapi.Visibility]int{}
 	types := map[immichapi.AssetType]int{}
-	var trashed, bridged, livePaired int
+	var trashed, iosShaped, otherUploader, noDeviceID, livePaired int
 	for _, a := range assets {
 		visibility[a.Visibility]++
 		types[a.Type]++
 		if a.IsTrashed {
 			trashed++
 		}
-		if a.DeviceAssetID != "" {
-			bridged++
+		switch {
+		case a.DeviceAssetID == "":
+			noDeviceID++
+		case looksIOSPHAsset(a.DeviceAssetID):
+			iosShaped++
+		default:
+			otherUploader++
 		}
 		if a.LivePhotoVideoID != "" {
 			livePaired++
@@ -211,7 +225,7 @@ func scanImmich(stdout, stderr io.Writer, urlFlag, keyEnvName string) int {
 	}
 	fmt.Fprintln(stdout, "trove scan immich")
 	fmt.Fprintf(stdout, "  server:        %s\n", c.URL())
-	fmt.Fprintf(stdout, "  total assets:  %d\n", len(assets))
+	fmt.Fprintf(stdout, "  total assets:  %d  (includes stack children — withStacked=true)\n", len(assets))
 	fmt.Fprintln(stdout, "  by type:")
 	fmt.Fprintf(stdout, "    images:      %d\n", types[immichapi.TypeImage])
 	fmt.Fprintf(stdout, "    videos:      %d\n", types[immichapi.TypeVideo])
@@ -223,9 +237,23 @@ func scanImmich(stdout, stderr io.Writer, urlFlag, keyEnvName string) int {
 	fmt.Fprintf(stdout, "    hidden:      %d\n", visibility[immichapi.VisibilityHidden])
 	fmt.Fprintf(stdout, "    locked:      %d\n", visibility[immichapi.VisibilityLocked])
 	fmt.Fprintf(stdout, "  trashed (isTrashed=true):    %d\n", trashed)
-	fmt.Fprintf(stdout, "  with PHAsset bridge id:      %d  (of %d total; the rest were uploaded by paths other than the iOS app)\n", bridged, len(assets))
+	fmt.Fprintln(stdout, "  by uploader source:")
+	fmt.Fprintf(stdout, "    iOS-style PHAsset id:    %d  (deviceAssetId starts with a UUID — trove's Photos → Immich bridge)\n", iosShaped)
+	fmt.Fprintf(stdout, "    other (Android, web, …): %d  (deviceAssetId set but not UUID-shaped; not bridge-matchable from Photos)\n", otherUploader)
+	fmt.Fprintf(stdout, "    no deviceAssetId set:    %d\n", noDeviceID)
 	fmt.Fprintf(stdout, "  Live Photo pairs:            %d  (stills with livePhotoVideoId pointing at their motion asset)\n", livePaired)
 	return 0
+}
+
+// uuidShapeRE matches the canonical 8-4-4-4-12 hex UUID. iOS Immich uploads
+// set deviceAssetId to "<PHAsset.ZUUID>/L0/<seq>"; non-iOS uploaders (Android,
+// web import, immich-go) use unrelated shapes. Cleanup-report will only match
+// the Photos → Immich bridge for the UUID-prefixed subset.
+var uuidShapeRE = regexp.MustCompile(`^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$`)
+
+func looksIOSPHAsset(s string) bool {
+	head, _, _ := strings.Cut(s, "/")
+	return uuidShapeRE.MatchString(head)
 }
 
 func defaultPhotosLibraryPath() (string, error) {

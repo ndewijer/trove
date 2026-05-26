@@ -14,6 +14,12 @@ import (
 )
 
 func TestRun(t *testing.T) {
+	// Ensure the "scan immich without --immich-url" case is deterministic —
+	// otherwise a CI/dev shell that exports IMMICH_URL would cause the
+	// fallback to fire and the test would see exit 1 (auth-key-missing)
+	// instead of exit 2 (URL-missing).
+	t.Setenv("IMMICH_URL", "")
+
 	tests := []struct {
 		name            string
 		args            []string
@@ -240,10 +246,13 @@ func TestScanImmich_HappyPath(t *testing.T) {
 	// Fake an Immich server with two pages of metadata, including a
 	// trashed asset and one with a non-empty deviceAssetId.
 	page1 := []map[string]any{
-		{"id": "id-A", "deviceAssetId": "phasset-A", "originalFileName": "A.HEIC", "type": "IMAGE", "visibility": "timeline"},
-		{"id": "id-B", "deviceAssetId": "phasset-B", "originalFileName": "B.MOV", "type": "VIDEO", "visibility": "archive"},
+		// iOS-shaped deviceAssetId (UUID/L0/001) — the Photos bridge subset.
+		{"id": "id-A", "deviceAssetId": "AB51027D-FEAE-4F0A-A662-009BF9C2E43B/L0/001", "originalFileName": "A.HEIC", "type": "IMAGE", "visibility": "timeline"},
+		// Android-shaped (MediaStore numeric id) — not bridge-matchable from Photos.
+		{"id": "id-B", "deviceAssetId": "1000040840", "originalFileName": "B.jpg", "type": "VIDEO", "visibility": "archive"},
 	}
 	page2 := []map[string]any{
+		// No deviceAssetId — web-import or partial upload edge.
 		{"id": "id-C", "deviceAssetId": "", "originalFileName": "C.HEIC", "type": "IMAGE", "visibility": "timeline", "isTrashed": true},
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -303,10 +312,40 @@ func TestScanImmich_HappyPath(t *testing.T) {
 		"timeline:    2",
 		"archive:     1",
 		"trashed (isTrashed=true):    1",
-		"with PHAsset bridge id:      2", // C has empty deviceAssetId
+		"iOS-style PHAsset id:    1", // A
+		"other (Android, web, …): 1", // B
+		"no deviceAssetId set:    1", // C
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Errorf("stdout missing %q\ngot:\n%s", want, stdout.String())
 		}
+	}
+}
+
+func TestScanImmich_URLFromEnvFallback(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("x-api-key") != "k" {
+			http.Error(w, "bad key", http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"assets": map[string]any{
+				"total": 0, "count": 0, "nextPage": nil, "items": []any{},
+			},
+			"albums": map[string]any{"total": 0, "count": 0, "nextPage": nil, "items": []any{}},
+		})
+	}))
+	defer srv.Close()
+
+	t.Setenv("IMMICH_URL", srv.URL)
+	t.Setenv("IMMICH_API_KEY", "k")
+
+	var stdout, stderr bytes.Buffer
+	exit := run([]string{"scan", "immich"}, &stdout, &stderr) // no --immich-url
+	if exit != 0 {
+		t.Fatalf("exit %d; stderr=%q", exit, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "total assets:  0") {
+		t.Errorf("expected scan to succeed via IMMICH_URL env fallback; stdout:\n%s", stdout.String())
 	}
 }
