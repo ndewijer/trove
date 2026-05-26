@@ -441,12 +441,15 @@ func TestResolveCompactUTI(t *testing.T) {
 		in   any
 		want string
 	}{
-		{"int 1 → jpeg", int64(1), "public.jpeg"},
-		{"int 3 → heic", int64(3), "public.heic"},
-		{"int 6 → mpeg-4", int64(6), "public.mpeg-4"},
-		{"int 23 → quicktime", int64(23), "com.apple.quicktime-movie"},
-		{"int 7 (documented unknown) → empty", int64(7), ""},
-		{"unmapped int → empty", int64(999), ""},
+		{"int64 1 → jpeg", int64(1), "public.jpeg"},
+		{"int64 3 → heic", int64(3), "public.heic"},
+		{"int64 6 → mpeg-4", int64(6), "public.mpeg-4"},
+		{"int64 23 → quicktime", int64(23), "com.apple.quicktime-movie"},
+		{"int64 7 (documented unknown) → empty", int64(7), ""},
+		{"int64 unmapped → empty", int64(999), ""},
+		{"int (driver-narrowed) 3 → heic", int(3), "public.heic"},
+		{"int (driver-narrowed) 23 → quicktime", int(23), "com.apple.quicktime-movie"},
+		{"int unmapped → empty", int(999), ""},
 		{"nil → empty", nil, ""},
 		{"string underscore-prefixed extended UTI", "_org.webmproject.webp", "org.webmproject.webp"},
 		{"string bare UTI passes through", "public.heic", "public.heic"},

@@ -379,21 +379,32 @@ func resolveCompactUTI(v any) string {
 	case nil:
 		return ""
 	case int64:
-		switch x {
-		case 1:
-			return "public.jpeg"
-		case 3:
-			return "public.heic"
-		case 6:
-			return "public.mpeg-4"
-		case 23:
-			return "com.apple.quicktime-movie"
-		}
-		return ""
+		return numericCompactUTI(x)
+	case int:
+		// modernc.org/sqlite delivers INTEGER as int64 today; this branch
+		// keeps the contract intact if a future driver release narrows
+		// small values to int. Without it the lookup would silently miss
+		// and every resource UTI would come back empty — and no fixture
+		// would catch that because int literals round-trip as int64.
+		return numericCompactUTI(int64(x))
 	case string:
 		return strings.TrimPrefix(x, "_")
 	case []byte:
 		return strings.TrimPrefix(string(x), "_")
+	}
+	return ""
+}
+
+func numericCompactUTI(n int64) string {
+	switch n {
+	case 1:
+		return "public.jpeg"
+	case 3:
+		return "public.heic"
+	case 6:
+		return "public.mpeg-4"
+	case 23:
+		return "com.apple.quicktime-movie"
 	}
 	return ""
 }
