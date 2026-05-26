@@ -67,12 +67,20 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 	_ = stdout
 	fs := newFlagSet("scan", stderr)
 	all := fs.Bool("all", false, "refresh all configured storages")
+	// --config default (~/Library/Application Support/trove/config.yaml) is
+	// applied where the file is opened, not during flag parsing — keeps an
+	// empty flag value meaning "use default" without depending on
+	// os.UserHomeDir at parse time. Same contract in every subcommand below.
 	cfgPath := fs.String("config", "", "path to config.yaml")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	_ = cfgPath
 
+	if *all && fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "trove scan: --all conflicts with positional %q\n", fs.Arg(0))
+		return 2
+	}
 	if *all {
 		fmt.Fprintln(stderr, "trove scan --all: not implemented yet")
 		return 1
